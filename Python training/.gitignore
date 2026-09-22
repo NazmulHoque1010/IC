@@ -2,3 +2,5 @@ ch12/
 .venv/
 api_key.txt
 janus-last-month.log
+data.md
+janus-grouped-by-session.log
