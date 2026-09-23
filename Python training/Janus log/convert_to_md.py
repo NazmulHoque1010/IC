@@ -7,7 +7,7 @@ def convert_log_to_md(log_path, md_path):
 
 if __name__ == "__main__":
     # Define your file paths here
-    input_log_file = r"C:\Users\Lenovo\Desktop\IC\Python training\Janus log\unique_occurrences.log"
-    output_md_file = r"C:\Users\Lenovo\Desktop\IC\Python training\Janus log\unique.md"
+    input_log_file = r"C:\Users\Lenovo\Desktop\IC\Python training\Janus log\janus-grouped-by-session.log"
+    output_md_file = r"C:\Users\Lenovo\Desktop\IC\Python training\Janus log\newlog.md"
     
     convert_log_to_md(input_log_file, output_md_file)
