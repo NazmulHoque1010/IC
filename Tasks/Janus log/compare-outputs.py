@@ -5,8 +5,8 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-FILE_1_PATH = r"C:\Users\Lenovo\Desktop\IC\Python training\Janus log\janus-grouped-by-session.log"
-FILE_2_PATH = r"C:\Users\Lenovo\Desktop\IC\Python training\Janus log\janus-grouped-by-session2.log"
+FILE_1_PATH = r"C:\Users\Lenovo\Desktop\IC\Tasks\Janus log\janus-grouped-by-session.log"
+FILE_2_PATH = r"C:\Users\Lenovo\Desktop\IC\Tasks\Janus log\janus-grouped-by-session2.log"
 
 GAP_WARNING_SECONDS = 300
 

@@ -19,7 +19,7 @@ def normalize(message: str) -> str:
     return sig.strip()
 
 def main():
-    default_path = r"C:\Users\Lenovo\Desktop\IC\Python training\Janus log\janus-last-month.log"
+    default_path = r"C:\Users\Lenovo\Desktop\IC\Tasks\Janus log\janus-last-month.log"
     
     if len(sys.argv) == 2:
         log_path = Path(sys.argv[1])
