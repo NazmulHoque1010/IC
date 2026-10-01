@@ -1,0 +1,9 @@
+<configuration name="xml_curl.conf" description="cURL XML Gateway">
+  <bindings>
+    <binding name="directory_lookup">
+      <param name="gateway-url" value="http://127.0.0.1:8080/"/>
+      <param name="method" value="POST"/>
+      <param name="bind-cnf" value="directory"/>
+    </binding>
+  </bindings>
+</configuration>

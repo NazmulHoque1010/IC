@@ -1,0 +1,12 @@
+[Unit]
+Description=FreeSWITCH XML Curl PHP Service
+After=network.target mysql.service
+
+[Service]
+ExecStart=/usr/bin/php -S 127.0.0.1:8080 /home/nazmul/fs_xml_service/index.php
+Restart=always
+User=nazmul
+WorkingDirectory=/home/nazmul/fs_xml_service
+
+[Install]
+WantedBy=multi-user.target
