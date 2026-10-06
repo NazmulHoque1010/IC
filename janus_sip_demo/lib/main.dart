@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'services/janus_rest_service.dart';
+
 void main() {
   runApp(const JanusSipDemoApp());
 }
@@ -37,7 +39,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   final _formKey = GlobalKey<FormState>();
 
   final _janusUrlController = TextEditingController(
-    text: 'http://192.168.97.53:8088/janus',
+    text: 'http://localhost:8088/janus',
   );
   final _sipServerController = TextEditingController(
     text: '192.168.97.53:5060',
@@ -52,8 +54,15 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   bool _isRegistered = false;
   bool _hidePassword = true;
 
+  bool _isTestingJanus = false;
+  String? _janusConnectionMessage;
+  bool _janusConnectionSucceeded = false;
+
+  JanusRestService? _janusService;
+
   @override
   void dispose() {
+    _janusService?.dispose();
     _janusUrlController.dispose();
     _sipServerController.dispose();
     _usernameController.dispose();
@@ -72,27 +81,120 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     setState(() {
       _isRegistering = true;
       _isRegistered = false;
+      _janusConnectionMessage = null;
+      _janusConnectionSucceeded = false;
     });
 
-    await Future<void>.delayed(const Duration(seconds: 1));
+    final previousService = _janusService;
+    _janusService = JanusRestService(
+      serverUrl: _janusUrlController.text.trim(),
+    );
+    await previousService?.dispose();
 
-    if (!mounted) {
+    try {
+      final result = await _janusService!.registerSip(
+        extension: _usernameController.text.trim(),
+        password: _passwordController.text,
+        sipServer: _sipServerController.text.trim(),
+        displayName: _displayNameController.text.trim(),
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      if (!result.event.isRegistered) {
+        throw JanusApiException(
+          'SIP registration failed (${result.event.code}): '
+          '${result.event.reason}',
+        );
+      }
+
+      setState(() {
+        _isRegistered = true;
+        _janusConnectionSucceeded = true;
+        _janusConnectionMessage =
+            'SIP registered as ${result.event.username}.\n'
+            'Janus session ID: ${result.sessionId}\n'
+            'SIP plugin handle ID: ${result.handleId}';
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('SIP registration through Janus succeeded.'),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isRegistered = false;
+        _janusConnectionSucceeded = false;
+        _janusConnectionMessage = 'SIP registration failed:\n$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isRegistering = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _testJanusConnection() async {
+    FocusScope.of(context).unfocus();
+
+    final janusUrl = _janusUrlController.text.trim();
+    final validationError = _janusUrlValidator(janusUrl);
+
+    if (validationError != null) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(validationError)));
       return;
     }
 
     setState(() {
-      _isRegistering = false;
-      _isRegistered = true;
+      _isTestingJanus = true;
+      _janusConnectionMessage = null;
+      _janusConnectionSucceeded = false;
     });
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Prototype only: registration status changed locally. '
-          'No Janus or SIP request has been sent yet.',
-        ),
-      ),
-    );
+    final service = JanusRestService(serverUrl: janusUrl);
+
+    try {
+      final result = await service.createSessionAndAttachSip();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _janusConnectionSucceeded = true;
+        _janusConnectionMessage =
+            'Connected to Janus successfully.\n'
+            'Session ID: ${result.sessionId}\n'
+            'SIP plugin handle ID: ${result.handleId}';
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _janusConnectionSucceeded = false;
+        _janusConnectionMessage = 'Janus connection failed:\n$error';
+      });
+    } finally {
+      await service.dispose();
+
+      if (mounted) {
+        setState(() {
+          _isTestingJanus = false;
+        });
+      }
+    }
   }
 
   void _openDialScreen() {
@@ -132,9 +234,9 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   @override
   Widget build(BuildContext context) {
     final statusText = _isRegistering
-        ? 'Registering...'
+        ? 'Registering through Janus...'
         : _isRegistered
-        ? 'Registered (prototype)'
+        ? 'Registered through Janus'
         : 'Not registered';
 
     final statusColor = _isRegistering
@@ -169,8 +271,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      'Enter the Janus gateway and SIP account details. '
-                      'This screen is UI-only in Phase 1.',
+                      'Register a SIP account through the Janus SIP plugin.',
                       textAlign: TextAlign.center,
                       style: Theme.of(context).textTheme.bodyMedium,
                     ),
@@ -183,9 +284,10 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                             TextFormField(
                               controller: _janusUrlController,
                               keyboardType: TextInputType.url,
+                              enabled: !_isRegistering && !_isRegistered,
                               decoration: const InputDecoration(
                                 labelText: 'Janus URL',
-                                hintText: 'http://192.168.97.53:8088/janus',
+                                hintText: 'http://localhost:8088/janus',
                                 prefixIcon: Icon(Icons.hub_outlined),
                                 border: OutlineInputBorder(),
                               ),
@@ -195,6 +297,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                             TextFormField(
                               controller: _sipServerController,
                               keyboardType: TextInputType.url,
+                              enabled: !_isRegistering && !_isRegistered,
                               decoration: const InputDecoration(
                                 labelText: 'SIP server',
                                 hintText: '192.168.97.53:5060',
@@ -207,18 +310,20 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                             const SizedBox(height: 16),
                             TextFormField(
                               controller: _usernameController,
+                              enabled: !_isRegistering && !_isRegistered,
                               decoration: const InputDecoration(
-                                labelText: 'SIP username',
-                                hintText: 'For example: janus',
+                                labelText: 'SIP extension',
+                                hintText: 'For example: 1001',
                                 prefixIcon: Icon(Icons.person_outline),
                                 border: OutlineInputBorder(),
                               ),
                               validator: (value) =>
-                                  _requiredValidator(value, 'SIP username'),
+                                  _requiredValidator(value, 'SIP extension'),
                             ),
                             const SizedBox(height: 16),
                             TextFormField(
                               controller: _passwordController,
+                              enabled: !_isRegistering && !_isRegistered,
                               obscureText: _hidePassword,
                               enableSuggestions: false,
                               autocorrect: false,
@@ -248,6 +353,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                             const SizedBox(height: 16),
                             TextFormField(
                               controller: _displayNameController,
+                              enabled: !_isRegistering && !_isRegistered,
                               decoration: const InputDecoration(
                                 labelText: 'Display name',
                                 prefixIcon: Icon(Icons.badge_outlined),
@@ -272,6 +378,60 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                           : Icons.info_outline,
                     ),
                     const SizedBox(height: 20),
+                    OutlinedButton.icon(
+                      onPressed: _isTestingJanus || _isRegistering
+                          ? null
+                          : _testJanusConnection,
+                      icon: _isTestingJanus
+                          ? const SizedBox(
+                              height: 18,
+                              width: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.network_check_outlined),
+                      label: Text(
+                        _isTestingJanus
+                            ? 'Testing Janus...'
+                            : 'Test Janus connection',
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                      ),
+                    ),
+                    if (_janusConnectionMessage != null) ...[
+                      const SizedBox(height: 12),
+                      Card(
+                        color:
+                            (_janusConnectionSucceeded
+                                    ? Colors.green
+                                    : Colors.red)
+                                .withValues(alpha: 0.12),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(
+                                _janusConnectionSucceeded
+                                    ? Icons.check_circle_outline
+                                    : Icons.error_outline,
+                                color: _janusConnectionSucceeded
+                                    ? Colors.green
+                                    : Colors.red,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  _janusConnectionMessage!,
+                                  style: Theme.of(context).textTheme.bodyMedium,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 20),
                     if (_isRegistered)
                       FilledButton.icon(
                         onPressed: _openDialScreen,
@@ -283,7 +443,9 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       )
                     else
                       FilledButton.icon(
-                        onPressed: _isRegistering ? null : _register,
+                        onPressed: _isRegistering || _isTestingJanus
+                            ? null
+                            : _register,
                         icon: _isRegistering
                             ? const SizedBox(
                                 height: 18,
@@ -303,8 +465,9 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                       ),
                     const SizedBox(height: 12),
                     Text(
-                      'Phase 1: no Janus, SIP, WebRTC, microphone, or '
-                      'network action has been performed.',
+                      'Current Phase 2: SIP registration through Janus is '
+                      'real. WebRTC audio and SIP calling are not '
+                      'implemented yet.',
                       textAlign: TextAlign.center,
                       style: Theme.of(context).textTheme.bodySmall,
                     ),
@@ -409,6 +572,7 @@ class _DialScreenState extends State<DialScreen> {
 
   void _startCallTimer() {
     _callTimer?.cancel();
+
     _callTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted || _callStatus != CallStatus.connected) {
         return;
@@ -511,6 +675,7 @@ class _DialScreenState extends State<DialScreen> {
   String _formatDuration(int seconds) {
     final minutes = seconds ~/ 60;
     final remainingSeconds = seconds % 60;
+
     return '${minutes.toString().padLeft(2, '0')}:'
         '${remainingSeconds.toString().padLeft(2, '0')}';
   }
@@ -668,8 +833,8 @@ class _DialScreenState extends State<DialScreen> {
                   const SizedBox(height: 24),
                   Text(
                     'Phase 1 simulation: Call changes local UI state only. '
-                    'No Janus request, WebRTC offer, audio stream, SIP INVITE, '
-                    'or SIP BYE is sent.',
+                    'No WebRTC offer, audio stream, SIP INVITE, or SIP BYE '
+                    'is sent.',
                     textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.bodySmall,
                   ),

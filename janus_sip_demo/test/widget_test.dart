@@ -4,7 +4,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:janus_sip_demo/main.dart';
 
 void main() {
-  testWidgets('registration screen is displayed', (WidgetTester tester) async {
+  testWidgets('registration screen displays local Janus URL', (
+    WidgetTester tester,
+  ) async {
     await tester.pumpWidget(const JanusSipDemoApp());
 
     expect(find.text('Connect to Janus'), findsOneWidget);
@@ -15,6 +17,6 @@ void main() {
       find.descendant(of: janusUrlField, matching: find.byType(EditableText)),
     );
 
-    expect(editableText.controller.text, 'http://192.168.97.53:8088/janus');
+    expect(editableText.controller.text, 'http://localhost:8088/janus');
   });
 }
