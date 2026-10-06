@@ -52,6 +52,8 @@ class _MyHomePageState extends State<MyHomePage> {
   bool _isCalling = false;
   bool _isInCall = false;
   bool _incomingCallVisible = false;
+  bool _incomingCancelledByCaller = false;
+  BuildContext? _incomingDialogContext;
   bool _eventLoopRunning = false;
   bool _processingRemoteHangup = false;
 
@@ -510,6 +512,12 @@ class _MyHomePageState extends State<MyHomePage> {
           '${const JsonEncoder.withIndent('  ').convert(resultData)}',
         );
 
+        // Caller cancelled while the incoming-call dialog is still open.
+        if (event == 'hangup' && _incomingCallVisible) {
+          _dismissIncomingDialogBecauseCallerHungUp();
+          continue;
+        }
+
         if (event == 'hangup' && !_isInCall && !_isCalling) {
           print('DEBUG: Ignoring stale hangup event.');
           continue;
@@ -522,9 +530,13 @@ class _MyHomePageState extends State<MyHomePage> {
 
           final callerExtension = _extractExtension(callerUri);
 
-          await _handleIncomingCall(
-            jsep,
-            callerExtension,
+          // Do not await: the loop must keep polling so it can see a
+          // hangup event while the dialog is still open.
+          unawaited(
+            _handleIncomingCall(
+              jsep,
+              callerExtension,
+            ),
           );
         } else if (event == 'calling') {
           setState(() {
@@ -574,6 +586,18 @@ class _MyHomePageState extends State<MyHomePage> {
     return match?.group(1) ?? 'Unknown';
   }
 
+  void _dismissIncomingDialogBecauseCallerHungUp() {
+    print('DEBUG: Caller hung up before the call was answered.');
+
+    _incomingCancelledByCaller = true;
+
+    final dialogContext = _incomingDialogContext;
+
+    if (dialogContext != null && dialogContext.mounted) {
+      Navigator.of(dialogContext).pop(false);
+    }
+  }
+
   Future<void> _handleIncomingCall(
     Map<String, dynamic>? jsep,
     String callerExtension,
@@ -584,12 +608,27 @@ class _MyHomePageState extends State<MyHomePage> {
     }
 
     _incomingCallVisible = true;
+    _incomingCancelledByCaller = false;
 
     final shouldAccept = await _showIncomingCallDialog(
       callerExtension,
     );
 
     _incomingCallVisible = false;
+    _incomingDialogContext = null;
+
+    if (_incomingCancelledByCaller) {
+      _incomingCancelledByCaller = false;
+
+      if (mounted) {
+        setState(() {
+          _status =
+              'Missed call from extension: $callerExtension (caller cancelled).';
+        });
+      }
+
+      return;
+    }
 
     if (!shouldAccept) {
       await _declineIncomingCall();
@@ -687,6 +726,8 @@ class _MyHomePageState extends State<MyHomePage> {
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
+        _incomingDialogContext = dialogContext;
+
         return AlertDialog(
           title: const Text('Incoming Call'),
           content: Text(
