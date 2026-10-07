@@ -20,6 +20,7 @@ class JanusSipDemoApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Janus SIP Demo',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
@@ -66,7 +67,6 @@ class _MyHomePageState extends State<MyHomePage> {
   String get _janusBaseUrl {
     final ip = _janusIpController.text.trim();
     final port = _janusPortController.text.trim();
-
     return 'http://$ip:$port/janus';
   }
 
@@ -95,6 +95,18 @@ class _MyHomePageState extends State<MyHomePage> {
     super.dispose();
   }
 
+  void _setStatus(String message) {
+    print('STATUS: $message');
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _status = message;
+    });
+  }
+
   String _randomTransaction() {
     return DateTime.now().microsecondsSinceEpoch.toString();
   }
@@ -119,7 +131,7 @@ class _MyHomePageState extends State<MyHomePage> {
             'transaction': _randomTransaction(),
           }),
         )
-        .timeout(const Duration(seconds: 10));
+        .timeout(const Duration(seconds: 15));
 
     print('DEBUG: Create session status: ${response.statusCode}');
     print('DEBUG: Create session body: ${response.body}');
@@ -152,7 +164,7 @@ class _MyHomePageState extends State<MyHomePage> {
             'transaction': _randomTransaction(),
           }),
         )
-        .timeout(const Duration(seconds: 10));
+        .timeout(const Duration(seconds: 15));
 
     print('DEBUG: Attach plugin status: ${response.statusCode}');
     print('DEBUG: Attach plugin body: ${response.body}');
@@ -177,7 +189,7 @@ class _MyHomePageState extends State<MyHomePage> {
         .get(
           Uri.parse('$_janusEventUrl?maxev=1'),
         )
-        .timeout(const Duration(seconds: 30));
+        .timeout(const Duration(seconds: 65));
 
     print('DEBUG: Event status: ${response.statusCode}');
     print('DEBUG: Event body: ${response.body}');
@@ -192,28 +204,34 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _registerWithJanus() async {
+    if (_isRegistering) {
+      return;
+    }
+
     setState(() {
       _isRegistering = true;
-      _status = 'Creating Janus session...';
       _isRegistered = false;
+      _isCalling = false;
+      _isInCall = false;
+      _sessionId = null;
+      _handleId = null;
+      _status = 'Creating Janus session...';
     });
 
     try {
+      await _disposeWebRtc();
+
       final sessionResponse = await _createJanusSession();
       final sessionId = sessionResponse['data']['id'] as int;
       _sessionId = sessionId;
 
-      setState(() {
-        _status = 'Attaching SIP plugin...';
-      });
+      _setStatus('Attaching SIP plugin...');
 
       final handleResponse = await _attachSipPlugin(sessionId: sessionId);
       final handleId = handleResponse['data']['id'] as int;
       _handleId = handleId;
 
-      setState(() {
-        _status = 'Sending SIP register request...';
-      });
+      _setStatus('Sending SIP registration request...');
 
       final registerResponse = await http
           .post(
@@ -233,7 +251,7 @@ class _MyHomePageState extends State<MyHomePage> {
               },
             }),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 15));
 
       print('DEBUG: Register status: ${registerResponse.statusCode}');
       print('DEBUG: Register body: ${registerResponse.body}');
@@ -250,13 +268,11 @@ class _MyHomePageState extends State<MyHomePage> {
       if (registerData['janus'] != 'ack' &&
           registerData['janus'] != 'success') {
         throw Exception(
-          'Janus rejected register request: ${registerData['error']}',
+          'Janus rejected registration: ${registerData['error']}',
         );
       }
 
-      setState(() {
-        _status = 'Waiting for registration event...';
-      });
+      _setStatus('Waiting for registration confirmation...');
 
       String? registrationEvent;
 
@@ -277,40 +293,39 @@ class _MyHomePageState extends State<MyHomePage> {
             registrationEvent == 'registration_failed') {
           break;
         }
-
-        await Future<void>.delayed(const Duration(seconds: 1));
       }
 
       if (registrationEvent == 'registered') {
+        if (!mounted) {
+          return;
+        }
+
         setState(() {
           _isRegistered = true;
           _status =
               'Registered as ${_usernameController.text.trim()}. '
-              'You can now call any extension or receive calls.';
+              'Ready to call or receive calls.';
         });
 
         _startEventLoop();
       } else {
-        setState(() {
-          _isRegistered = false;
-          _status =
-              'Registration not confirmed. Final event: $registrationEvent';
-        });
+        _setStatus(
+          'Registration was not confirmed. Final event: '
+          '${registrationEvent ?? 'none'}',
+        );
       }
     } on TimeoutException {
-      setState(() {
-        _isRegistered = false;
-        _status = 'Registration timed out waiting for Janus.';
-      });
-    } catch (error) {
-      setState(() {
-        _isRegistered = false;
-        _status = 'Registration failed: $error';
-      });
+      _setStatus('Registration timed out waiting for Janus.');
+    } catch (error, stackTrace) {
+      print('REGISTER ERROR: $error');
+      print(stackTrace);
+      _setStatus('Registration failed: $error');
     } finally {
-      setState(() {
-        _isRegistering = false;
-      });
+      if (mounted) {
+        setState(() {
+          _isRegistering = false;
+        });
+      }
     }
   }
 
@@ -319,12 +334,14 @@ class _MyHomePageState extends State<MyHomePage> {
       return;
     }
 
-    setState(() {
-      _status = 'Requesting microphone...';
-    });
+    _setStatus('Requesting microphone permission...');
 
     final stream = await navigator.mediaDevices.getUserMedia({
-      'audio': true,
+      'audio': {
+        'echoCancellation': true,
+        'noiseSuppression': true,
+        'autoGainControl': true,
+      },
       'video': false,
     });
 
@@ -332,47 +349,68 @@ class _MyHomePageState extends State<MyHomePage> {
 
     final audioTracks = stream.getAudioTracks();
 
-    print('Microphone tracks found: ${audioTracks.length}');
+    print('DEBUG: Microphone tracks found: ${audioTracks.length}');
 
-    if (audioTracks.isEmpty) {
-      throw Exception('No microphone audio track was returned');
+    for (final track in audioTracks) {
+      print(
+        'DEBUG: mic track '
+        'id=${track.id}, '
+        'kind=${track.kind}, '
+        'enabled=${track.enabled}',
+      );
     }
 
-    setState(() {
-      _status = 'Creating WebRTC PeerConnection...';
-    });
+    if (audioTracks.isEmpty) {
+      throw Exception('No microphone audio track was returned.');
+    }
+
+    _setStatus('Creating WebRTC PeerConnection...');
 
     final peerConnection = await createPeerConnection({
       'iceServers': [
         {'urls': 'stun:stun.l.google.com:19302'},
       ],
+      'sdpSemantics': 'unified-plan',
     });
 
     _peerConnection = peerConnection;
 
     peerConnection.onIceCandidate = (candidate) {
       if (candidate != null) {
-        _sendIceCandidate(candidate);
+        unawaited(_sendIceCandidate(candidate));
       }
     };
 
     peerConnection.onConnectionState = (state) {
-      print('PeerConnection state: $state');
+      print('DEBUG: PeerConnection state: $state');
 
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
-        setState(() {
-          _status = 'Call connected. Audio should be active.';
-        });
+        _setStatus('WebRTC connected. Audio should be active.');
       } else if (state ==
           RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
-        setState(() {
-          _status = 'Call failed: WebRTC connection failed.';
-        });
+        _setStatus('Call failed: WebRTC connection failed.');
+      } else if (state ==
+          RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+        _setStatus('WebRTC disconnected. Waiting for call status...');
       }
+    };
+
+    peerConnection.onIceConnectionState = (state) {
+      print('DEBUG: ICE connection state: $state');
     };
 
     for (final track in stream.getTracks()) {
       await peerConnection.addTrack(track, stream);
+    }
+
+    final senders = await peerConnection.getSenders();
+
+    for (final sender in senders) {
+      print(
+        'DEBUG: RTP sender '
+        'track=${sender.track?.kind}, '
+        'enabled=${sender.track?.enabled}',
+      );
     }
   }
 
@@ -380,16 +418,12 @@ class _MyHomePageState extends State<MyHomePage> {
     final destination = _destinationSipUser;
 
     if (!_isRegistered) {
-      setState(() {
-        _status = 'Register before calling.';
-      });
+      _setStatus('Register before calling.');
       return;
     }
 
     if (destination.isEmpty) {
-      setState(() {
-        _status = 'Enter a destination extension.';
-      });
+      _setStatus('Enter a destination extension.');
       return;
     }
 
@@ -399,17 +433,17 @@ class _MyHomePageState extends State<MyHomePage> {
 
     setState(() {
       _isCalling = true;
+      _isInCall = false;
       _status = 'Preparing microphone and WebRTC...';
     });
 
     try {
+      await _disposeWebRtc();
       await _ensureMicrophoneAndPeerConnection();
 
       final peerConnection = _peerConnection!;
 
-      setState(() {
-        _status = 'Creating SDP offer...';
-      });
+      _setStatus('Creating SDP offer...');
 
       final offer = await peerConnection.createOffer({
         'offerToReceiveAudio': 1,
@@ -420,9 +454,11 @@ class _MyHomePageState extends State<MyHomePage> {
 
       final localDescription = await peerConnection.getLocalDescription();
 
-      setState(() {
-        _status = 'Sending SIP INVITE through Janus...';
-      });
+      if (localDescription?.sdp == null || localDescription!.sdp!.isEmpty) {
+        throw Exception('WebRTC created an empty SDP offer.');
+      }
+
+      _setStatus('Sending SIP INVITE through Janus...');
 
       final response = await http
           .post(
@@ -436,12 +472,12 @@ class _MyHomePageState extends State<MyHomePage> {
                 'uri': 'sip:$destination@$_sipServer:$_sipServerPort',
               },
               'jsep': {
-                'type': localDescription?.type,
-                'sdp': localDescription?.sdp,
+                'type': localDescription.type,
+                'sdp': localDescription.sdp,
               },
             }),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 15));
 
       print('DEBUG: Call status: ${response.statusCode}');
       print('DEBUG: Call body: ${response.body}');
@@ -458,31 +494,37 @@ class _MyHomePageState extends State<MyHomePage> {
         throw Exception('Janus rejected call request: ${data['error']}');
       }
 
-      setState(() {
-        _isCalling = false;
-        _isInCall = true;
-        _status = 'Calling $destination...';
-      });
-    } catch (error) {
-      print('Call failed: $error');
+      if (!mounted) {
+        return;
+      }
 
       setState(() {
-        _isCalling = false;
+        _isCalling = true;
         _isInCall = false;
-        _status = 'Call failed: $error';
+        _status = 'INVITE sent. Waiting for the destination to ring...';
       });
+    } catch (error, stackTrace) {
+      print('CALL ERROR: $error');
+      print(stackTrace);
 
-      await _hangup();
+      await _disposeWebRtc();
+
+      if (mounted) {
+        setState(() {
+          _isCalling = false;
+          _isInCall = false;
+          _status = 'Call failed: $error';
+        });
+      }
     }
   }
 
   void _startEventLoop() {
-    if (_eventLoopRunning) {
+    if (_eventLoopRunning || !_isRegistered) {
       return;
     }
 
     _eventLoopRunning = true;
-
     unawaited(_eventLoop());
   }
 
@@ -512,61 +554,101 @@ class _MyHomePageState extends State<MyHomePage> {
           '${const JsonEncoder.withIndent('  ').convert(resultData)}',
         );
 
-        // Caller cancelled while the incoming-call dialog is still open.
         if (event == 'hangup' && _incomingCallVisible) {
           _dismissIncomingDialogBecauseCallerHungUp();
           continue;
         }
 
-        if (event == 'hangup' && !_isInCall && !_isCalling) {
-          print('DEBUG: Ignoring stale hangup event.');
+        if (event == 'incomingcall') {
+          final jsep = eventData['jsep'] as Map<String, dynamic>?;
+          final callerUri = resultData['username'] as String? ?? '';
+          final callerExtension = _extractExtension(callerUri);
+
+          unawaited(
+            _handleIncomingCall(jsep, callerExtension),
+          );
+          continue;
+        }
+
+        if (event == 'calling') {
+          if (mounted) {
+            setState(() {
+              _isCalling = true;
+              _isInCall = false;
+              _status = 'Calling $_destinationSipUser...';
+            });
+          }
           continue;
         }
 
         final jsep = eventData['jsep'] as Map<String, dynamic>?;
 
-        if (event == 'incomingcall') {
-          final callerUri = resultData['username'] as String? ?? '';
-
-          final callerExtension = _extractExtension(callerUri);
-
-          // Do not await: the loop must keep polling so it can see a
-          // hangup event while the dialog is still open.
-          unawaited(
-            _handleIncomingCall(
-              jsep,
-              callerExtension,
-            ),
-          );
-        } else if (event == 'calling') {
-          setState(() {
-            _status = 'Calling $_destinationSipUser...';
-          });
-        } else if (event == 'progress') {
+        if (event == 'proceeding') {
           if (jsep != null) {
             await _applyRemoteAnswer(jsep);
           }
 
-          setState(() {
-            _status = 'Call progressing. Applying audio answer...';
-          });
-        } else if (event == 'ringing') {
-          setState(() {
-            _status = 'Ringing $_destinationSipUser...';
-          });
-        } else if (event == 'accepted') {
-          if (jsep != null) {
-            await _applyRemoteAnswer(jsep);
+          if (mounted) {
+            setState(() {
+              _isCalling = true;
+              _isInCall = false;
+              _status = 'Call proceeding. Waiting for answer...';
+            });
           }
-
-          setState(() {
-            _status = 'Call accepted.';
-          });
-        } else if (event == 'hangup') {
-          await _handleRemoteHangup();
+          continue;
         }
-      } catch (error) {
-        print('Error while handling Janus SIP event: $error');
+
+        if (event == 'progress') {
+          if (jsep != null) {
+            await _applyRemoteAnswer(jsep);
+          }
+
+          if (mounted) {
+            setState(() {
+              _isCalling = true;
+              _isInCall = false;
+              _status = 'Call progressing. Waiting for answer...';
+            });
+          }
+          continue;
+        }
+
+        if (event == 'ringing') {
+          if (mounted) {
+            setState(() {
+              _isCalling = true;
+              _isInCall = false;
+              _status = 'Ringing $_destinationSipUser...';
+            });
+          }
+          continue;
+        }
+
+        if (event == 'accepted') {
+          if (jsep != null) {
+            await _applyRemoteAnswer(jsep);
+          }
+
+          if (mounted) {
+            setState(() {
+              _isCalling = false;
+              _isInCall = true;
+              _status = 'Call accepted. Connecting audio...';
+            });
+          }
+          continue;
+        }
+
+        if (event == 'hangup') {
+          await _handleRemoteHangup(resultData);
+        }
+      } on TimeoutException {
+        // Normal behavior for a Janus REST long-poll when there are no events.
+        // Immediately create the next long-poll request.
+        continue;
+      } catch (error, stackTrace) {
+        print('EVENT LOOP ERROR: $error');
+        print(stackTrace);
 
         if (!_isRegistered) {
           break;
@@ -580,9 +662,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _extractExtension(String sipUri) {
-    // Example input: sip:1000@192.168.97.53:5070
     final match = RegExp(r'sip:([^@]+)@').firstMatch(sipUri);
-
     return match?.group(1) ?? 'Unknown';
   }
 
@@ -602,7 +682,7 @@ class _MyHomePageState extends State<MyHomePage> {
     Map<String, dynamic>? jsep,
     String callerExtension,
   ) async {
-    if (_incomingCallVisible || _isInCall) {
+    if (_incomingCallVisible || _isInCall || _isCalling) {
       await _declineIncomingCall();
       return;
     }
@@ -610,9 +690,7 @@ class _MyHomePageState extends State<MyHomePage> {
     _incomingCallVisible = true;
     _incomingCancelledByCaller = false;
 
-    final shouldAccept = await _showIncomingCallDialog(
-      callerExtension,
-    );
+    final shouldAccept = await _showIncomingCallDialog(callerExtension);
 
     _incomingCallVisible = false;
     _incomingDialogContext = null;
@@ -620,13 +698,10 @@ class _MyHomePageState extends State<MyHomePage> {
     if (_incomingCancelledByCaller) {
       _incomingCancelledByCaller = false;
 
-      if (mounted) {
-        setState(() {
-          _status =
-              'Missed call from extension: $callerExtension (caller cancelled).';
-        });
-      }
-
+      _setStatus(
+        'Missed call from extension: $callerExtension '
+        '(caller cancelled).',
+      );
       return;
     }
 
@@ -637,14 +712,16 @@ class _MyHomePageState extends State<MyHomePage> {
 
     try {
       if (jsep == null) {
-        throw Exception('Incoming call has no SDP offer');
+        throw Exception('Incoming call has no SDP offer.');
       }
 
       setState(() {
-        _isInCall = true;
+        _isCalling = true;
+        _isInCall = false;
         _status = 'Accepting incoming call...';
       });
 
+      await _disposeWebRtc();
       await _ensureMicrophoneAndPeerConnection();
 
       final peerConnection = _peerConnection!;
@@ -653,16 +730,14 @@ class _MyHomePageState extends State<MyHomePage> {
       final offerSdp = jsep['sdp'] as String?;
 
       if (offerType == null || offerSdp == null) {
-        throw Exception('Incoming call SDP is invalid');
+        throw Exception('Incoming call SDP is invalid.');
       }
 
       await peerConnection.setRemoteDescription(
         RTCSessionDescription(offerSdp, offerType),
       );
 
-      setState(() {
-        _status = 'Creating call answer...';
-      });
+      _setStatus('Creating call answer...');
 
       final answer = await peerConnection.createAnswer({
         'offerToReceiveAudio': 1,
@@ -672,6 +747,12 @@ class _MyHomePageState extends State<MyHomePage> {
       await peerConnection.setLocalDescription(answer);
 
       final localDescription = await peerConnection.getLocalDescription();
+
+      if (localDescription?.sdp == null || localDescription!.sdp!.isEmpty) {
+        throw Exception('WebRTC created an empty SDP answer.');
+      }
+
+      _setStatus('Sending call acceptance to Janus...');
 
       final response = await http
           .post(
@@ -684,12 +765,12 @@ class _MyHomePageState extends State<MyHomePage> {
                 'request': 'accept',
               },
               'jsep': {
-                'type': localDescription?.type,
-                'sdp': localDescription?.sdp,
+                'type': localDescription.type,
+                'sdp': localDescription.sdp,
               },
             }),
           )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 15));
 
       print('DEBUG: Accept status: ${response.statusCode}');
       print('DEBUG: Accept body: ${response.body}');
@@ -700,18 +781,32 @@ class _MyHomePageState extends State<MyHomePage> {
         );
       }
 
-      setState(() {
-        _status = 'Incoming call accepted.';
-      });
-    } catch (error) {
-      print('Failed to handle incoming call: $error');
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
 
-      setState(() {
-        _isInCall = false;
-        _status = 'Incoming call failed: $error';
-      });
+      if (data['janus'] != 'ack' && data['janus'] != 'success') {
+        throw Exception('Janus rejected call accept: ${data['error']}');
+      }
 
-      await _hangup();
+      if (mounted) {
+        setState(() {
+          _isCalling = true;
+          _isInCall = false;
+          _status = 'Acceptance sent. Waiting for call confirmation...';
+        });
+      }
+    } catch (error, stackTrace) {
+      print('INCOMING CALL ERROR: $error');
+      print(stackTrace);
+
+      await _disposeWebRtc();
+
+      if (mounted) {
+        setState(() {
+          _isInCall = false;
+          _isCalling = false;
+          _status = 'Incoming call failed: $error';
+        });
+      }
     }
   }
 
@@ -772,11 +867,11 @@ class _MyHomePageState extends State<MyHomePage> {
       print('DEBUG: Decline status: ${response.statusCode}');
       print('DEBUG: Decline body: ${response.body}');
 
-      setState(() {
-        _status = 'Incoming call rejected.';
-      });
-    } catch (error) {
-      print('Failed to decline incoming call: $error');
+      _setStatus('Incoming call rejected.');
+    } catch (error, stackTrace) {
+      print('DECLINE ERROR: $error');
+      print(stackTrace);
+      _setStatus('Could not reject incoming call: $error');
     }
   }
 
@@ -786,6 +881,7 @@ class _MyHomePageState extends State<MyHomePage> {
     final peerConnection = _peerConnection;
 
     if (peerConnection == null) {
+      _setStatus('Remote SDP arrived, but no WebRTC PeerConnection exists.');
       return;
     }
 
@@ -793,7 +889,7 @@ class _MyHomePageState extends State<MyHomePage> {
     final sdp = jsep['sdp'] as String?;
 
     if (type == null || sdp == null) {
-      print('Janus sent no usable SDP answer');
+      _setStatus('Janus sent no usable SDP answer.');
       return;
     }
 
@@ -801,9 +897,7 @@ class _MyHomePageState extends State<MyHomePage> {
       RTCSessionDescription(sdp, type),
     );
 
-    setState(() {
-      _status = 'Remote SDP applied. Audio negotiation complete.';
-    });
+    _setStatus('Remote SDP applied. Establishing audio...');
   }
 
   Future<void> _sendIceCandidate(RTCIceCandidate candidate) async {
@@ -834,18 +928,25 @@ class _MyHomePageState extends State<MyHomePage> {
         '${candidate.candidate} '
         'HTTP ${response.statusCode}',
       );
-    } catch (error) {
-      print('Failed to send ICE candidate: $error');
+    } catch (error, stackTrace) {
+      print('ICE CANDIDATE ERROR: $error');
+      print(stackTrace);
     }
   }
 
-  Future<void> _handleRemoteHangup() async {
+  Future<void> _handleRemoteHangup(
+    Map<String, dynamic> resultData,
+  ) async {
     if (_processingRemoteHangup) {
       return;
     }
 
     _processingRemoteHangup = true;
-    _isInCall = false;
+
+    final code = resultData['code'];
+    final reason = resultData['reason'];
+
+    print('DEBUG: Remote hangup. Code: $code, reason: $reason');
 
     await _disposeWebRtc();
 
@@ -853,7 +954,8 @@ class _MyHomePageState extends State<MyHomePage> {
       setState(() {
         _isCalling = false;
         _isInCall = false;
-        _status = 'Call ended. Ready for another call.';
+        _status = 'Call ended — code: ${code ?? 'unknown'}, '
+            'reason: ${reason ?? 'unknown'}.';
       });
     }
 
@@ -864,8 +966,6 @@ class _MyHomePageState extends State<MyHomePage> {
     if (_processingRemoteHangup) {
       return;
     }
-
-    _isInCall = false;
 
     final sessionId = _sessionId;
     final handleId = _handleId;
@@ -886,8 +986,9 @@ class _MyHomePageState extends State<MyHomePage> {
 
         print('DEBUG: Hangup status: ${response.statusCode}');
         print('DEBUG: Hangup body: ${response.body}');
-      } catch (error) {
-        print('Hangup request failed: $error');
+      } catch (error, stackTrace) {
+        print('HANGUP ERROR: $error');
+        print(stackTrace);
       }
     }
 
@@ -897,7 +998,7 @@ class _MyHomePageState extends State<MyHomePage> {
       setState(() {
         _isCalling = false;
         _isInCall = false;
-        _status = 'Call ended. Ready for another call.';
+        _status = 'Call ended locally. Ready for another call.';
       });
     }
   }
@@ -906,157 +1007,178 @@ class _MyHomePageState extends State<MyHomePage> {
     try {
       await _localStream?.dispose();
       await _peerConnection?.close();
-    } catch (_) {
-      // Ignore cleanup errors.
+    } catch (error) {
+      print('WebRTC cleanup warning: $error');
     }
 
     _localStream = null;
     _peerConnection = null;
   }
 
+  Widget _buildInput({
+    required TextEditingController controller,
+    required String label,
+    TextInputType? keyboardType,
+    bool obscureText = false,
+  }) {
+    return TextField(
+      controller: controller,
+      keyboardType: keyboardType,
+      obscureText: obscureText,
+      textInputAction: TextInputAction.next,
+      decoration: InputDecoration(
+        labelText: label,
+        border: const OutlineInputBorder(),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final bottomPadding = MediaQuery.of(context).viewPadding.bottom;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Janus SIP Demo'),
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            TextField(
-              controller: _janusIpController,
-              decoration: const InputDecoration(
-                labelText: 'Janus IP',
-                border: OutlineInputBorder(),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: EdgeInsets.fromLTRB(16, 16, 16, 24 + bottomPadding),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildInput(
+                controller: _janusIpController,
+                label: 'Janus IP',
+                keyboardType: TextInputType.url,
               ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _janusPortController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'Janus HTTP port',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _sipServerController,
-              decoration: const InputDecoration(
-                labelText: 'SIP server IP',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _sipPortController,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'SIP server port',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _usernameController,
-              decoration: const InputDecoration(
-                labelText: 'SIP username',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _passwordController,
-              obscureText: true,
-              decoration: const InputDecoration(
-                labelText: 'SIP password',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 24),
-            ElevatedButton(
-              onPressed: _isRegistering ? null : _registerWithJanus,
-              child: _isRegistering
-                  ? const SizedBox(
-                      height: 20,
-                      width: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Text('Register with Janus'),
-            ),
-            if (_isRegistered) ...[
-              const SizedBox(height: 24),
-              TextField(
-                controller: _destinationController,
+              const SizedBox(height: 12),
+              _buildInput(
+                controller: _janusPortController,
+                label: 'Janus HTTP port',
                 keyboardType: TextInputType.number,
-                decoration: const InputDecoration(
-                  labelText: 'Destination extension',
-                  border: OutlineInputBorder(),
+              ),
+              const SizedBox(height: 12),
+              _buildInput(
+                controller: _sipServerController,
+                label: 'SIP server IP',
+                keyboardType: TextInputType.url,
+              ),
+              const SizedBox(height: 12),
+              _buildInput(
+                controller: _sipPortController,
+                label: 'SIP server port',
+                keyboardType: TextInputType.number,
+              ),
+              const SizedBox(height: 12),
+              _buildInput(
+                controller: _usernameController,
+                label: 'SIP username',
+                keyboardType: TextInputType.text,
+              ),
+              const SizedBox(height: 12),
+              _buildInput(
+                controller: _passwordController,
+                label: 'SIP password',
+                obscureText: true,
+                keyboardType: TextInputType.visiblePassword,
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton(
+                onPressed: _isRegistering ? null : _registerWithJanus,
+                child: _isRegistering
+                    ? const SizedBox(
+                        height: 20,
+                        width: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('Register with Janus'),
+              ),
+              if (_isRegistered) ...[
+                const SizedBox(height: 24),
+                const Divider(),
+                const SizedBox(height: 8),
+                Text(
+                  'Call controls',
+                  style: Theme.of(context).textTheme.titleMedium,
                 ),
-              ),
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  Expanded(
-                    child: ElevatedButton(
-                      onPressed:
-                          (!_isCalling && !_isInCall) ? _startCall : null,
-                      child: _isCalling
-                          ? const SizedBox(
-                              height: 20,
-                              width: 20,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                              ),
-                            )
-                          : const Text('Call'),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: ElevatedButton(
-                      onPressed: (_isInCall || _isCalling)
-                          ? _hangup
-                          : null,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.red,
-                        foregroundColor: Colors.white,
-                      ),
-                      child: const Text('Hang up'),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-            const SizedBox(height: 24),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                const SizedBox(height: 12),
+                _buildInput(
+                  controller: _destinationController,
+                  label: 'Destination extension',
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 12),
+                Row(
                   children: [
-                    Text(
-                      'Status',
-                      style: Theme.of(context).textTheme.titleMedium,
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed:
+                            (!_isCalling && !_isInCall) ? _startCall : null,
+                        child: _isCalling
+                            ? const SizedBox(
+                                height: 20,
+                                width: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Text('Call'),
+                      ),
                     ),
-                    const SizedBox(height: 8),
-                    Text(_status),
-                    const SizedBox(height: 8),
-                    Text('Janus session ID: ${_sessionId ?? 'none'}'),
-                    Text('SIP handle ID: ${_handleId ?? 'none'}'),
-                    Text(
-                      'Registered: ${_isRegistered ? 'yes' : 'no'}',
-                    ),
-                    Text(
-                      'In call: ${_isInCall ? 'yes' : 'no'}',
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: (_isInCall || _isCalling) ? _hangup : null,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.red,
+                          foregroundColor: Colors.white,
+                        ),
+                        child: const Text('Hang up'),
+                      ),
                     ),
                   ],
                 ),
+              ],
+              const SizedBox(height: 24),
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Status',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 8),
+                      SelectableText(_status),
+                      const SizedBox(height: 12),
+                      const Divider(),
+                      const SizedBox(height: 8),
+                      SelectableText(
+                        'Janus session ID: ${_sessionId ?? 'none'}',
+                      ),
+                      SelectableText(
+                        'SIP handle ID: ${_handleId ?? 'none'}',
+                      ),
+                      SelectableText(
+                        'Registered: ${_isRegistered ? 'yes' : 'no'}',
+                      ),
+                      SelectableText(
+                        'In call: ${_isInCall ? 'yes' : 'no'}',
+                      ),
+                      SelectableText(
+                        'Calling: ${_isCalling ? 'yes' : 'no'}',
+                      ),
+                    ],
+                  ),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
