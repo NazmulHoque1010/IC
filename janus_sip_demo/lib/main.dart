@@ -1,12 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:http/http.dart' as http;
 
-// Temporary development-only lint suppression.
-// Replace print() with a logging package before production use.
 // ignore_for_file: avoid_print, unnecessary_string_interpolations
 
 void main() {
@@ -19,7 +17,7 @@ class JanusSipDemoApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Janus SIP Demo',
+      title: 'Janus SIP Demo (WebSocket)',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
@@ -39,7 +37,8 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage> {
   final TextEditingController _janusIpController = TextEditingController();
-  final TextEditingController _janusPortController = TextEditingController();
+  final TextEditingController _janusPortController =
+      TextEditingController(text: '8188');
   final TextEditingController _sipServerController = TextEditingController();
   final TextEditingController _sipPortController = TextEditingController();
   final TextEditingController _usernameController = TextEditingController();
@@ -55,35 +54,40 @@ class _MyHomePageState extends State<MyHomePage> {
   bool _incomingCallVisible = false;
   bool _incomingCancelledByCaller = false;
   BuildContext? _incomingDialogContext;
-  bool _eventLoopRunning = false;
   bool _processingRemoteHangup = false;
 
   int? _sessionId;
   int? _handleId;
 
+  WebSocket? _socket;
+  StreamSubscription<dynamic>? _socketSub;
+  Timer? _keepAliveTimer;
+
+  final Map<String, Completer<Map<String, dynamic>>> _pending = {};
+  Completer<String>? _registrationCompleter;
+  Future<void> _eventChain = Future<void>.value();
+  int _transactionCounter = 0;
+
   MediaStream? _localStream;
   RTCPeerConnection? _peerConnection;
 
-  String get _janusBaseUrl {
+  String get _janusWsUrl {
     final ip = _janusIpController.text.trim();
     final port = _janusPortController.text.trim();
-    return 'http://$ip:$port/janus';
+    return 'ws://$ip:$port';
   }
 
-  String get _sipServer {
-    return _sipServerController.text.trim();
-  }
+  String get _sipServer => _sipServerController.text.trim();
 
-  int get _sipServerPort {
-    return int.tryParse(_sipPortController.text.trim()) ?? 5060;
-  }
+  int get _sipServerPort =>
+      int.tryParse(_sipPortController.text.trim()) ?? 5060;
 
-  String get _destinationSipUser {
-    return _destinationController.text.trim();
-  }
+  String get _destinationSipUser => _destinationController.text.trim();
 
   @override
   void dispose() {
+    _keepAliveTimer?.cancel();
+
     _janusIpController.dispose();
     _janusPortController.dispose();
     _sipServerController.dispose();
@@ -91,16 +95,17 @@ class _MyHomePageState extends State<MyHomePage> {
     _usernameController.dispose();
     _passwordController.dispose();
     _destinationController.dispose();
-    _disposeWebRtc();
+
+    unawaited(_closeWebSocket());
+    unawaited(_disposeWebRtc());
+
     super.dispose();
   }
 
   void _setStatus(String message) {
     print('STATUS: $message');
 
-    if (!mounted) {
-      return;
-    }
+    if (!mounted) return;
 
     setState(() {
       _status = message;
@@ -108,219 +113,356 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   String _randomTransaction() {
-    return DateTime.now().microsecondsSinceEpoch.toString();
+    _transactionCounter++;
+    return '${DateTime.now().microsecondsSinceEpoch}-$_transactionCounter';
   }
 
-  String get _janusEventUrl {
-    final sessionId = _sessionId;
+  // ---------------------------------------------------------------------------
+  // WebSocket transport
+  // ---------------------------------------------------------------------------
 
-    if (sessionId == null) {
-      throw Exception('No active Janus session');
-    }
+  Future<void> _connectWebSocket() async {
+    await _closeWebSocket();
 
-    return '$_janusBaseUrl/$sessionId';
+    final url = _janusWsUrl;
+
+    _setStatus('Connecting to Janus WebSocket $url ...');
+
+    final socket = await WebSocket.connect(
+      url,
+      protocols: ['janus-protocol'],
+    ).timeout(const Duration(seconds: 10));
+
+    socket.pingInterval = const Duration(seconds: 20);
+
+    print('DEBUG: WebSocket connected. Subprotocol: ${socket.protocol}');
+
+    _socket = socket;
+
+    _socketSub = socket.listen(
+      _onSocketData,
+      onError: (Object error) {
+        print('DEBUG: WebSocket error: $error');
+      },
+      onDone: () => _onSocketDone(socket),
+      cancelOnError: false,
+    );
   }
 
-  Future<Map<String, dynamic>> _createJanusSession() async {
-    final response = await http
-        .post(
-          Uri.parse(_janusBaseUrl),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'janus': 'create',
-            'transaction': _randomTransaction(),
-          }),
-        )
-        .timeout(const Duration(seconds: 15));
+  Future<void> _closeWebSocket() async {
+    _keepAliveTimer?.cancel();
+    _keepAliveTimer = null;
 
-    print('DEBUG: Create session status: ${response.statusCode}');
-    print('DEBUG: Create session body: ${response.body}');
+    final subscription = _socketSub;
+    final socket = _socket;
 
-    if (response.statusCode != 200) {
-      throw Exception(
-        'Failed to create Janus session: HTTP ${response.statusCode}',
-      );
+    _socketSub = null;
+    _socket = null;
+
+    for (final completer in _pending.values) {
+      if (!completer.isCompleted) {
+        completer.completeError(Exception('WebSocket closed'));
+      }
     }
 
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    _pending.clear();
 
-    if (data['janus'] != 'success') {
-      throw Exception('Janus session creation failed: ${data['error']}');
-    }
+    try {
+      await subscription?.cancel();
+    } catch (_) {}
 
-    return data;
+    try {
+      await socket?.close();
+    } catch (_) {}
   }
 
-  Future<Map<String, dynamic>> _attachSipPlugin({
-    required int sessionId,
-  }) async {
-    final response = await http
-        .post(
-          Uri.parse('$_janusBaseUrl/$sessionId'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'janus': 'attach',
-            'plugin': 'janus.plugin.sip',
-            'transaction': _randomTransaction(),
-          }),
-        )
-        .timeout(const Duration(seconds: 15));
-
-    print('DEBUG: Attach plugin status: ${response.statusCode}');
-    print('DEBUG: Attach plugin body: ${response.body}');
-
-    if (response.statusCode != 200) {
-      throw Exception(
-        'Failed to attach SIP plugin: HTTP ${response.statusCode}',
-      );
-    }
-
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
-
-    if (data['janus'] != 'success') {
-      throw Exception('SIP plugin attach failed: ${data['error']}');
-    }
-
-    return data;
-  }
-
-  Future<Map<String, dynamic>> _getNextEvent() async {
-    final response = await http
-        .get(
-          Uri.parse('$_janusEventUrl?maxev=1'),
-        )
-        .timeout(const Duration(seconds: 65));
-
-    print('DEBUG: Event status: ${response.statusCode}');
-    print('DEBUG: Event body: ${response.body}');
-
-    if (response.statusCode != 200) {
-      throw Exception(
-        'Failed to read Janus event: HTTP ${response.statusCode}',
-      );
-    }
-
-    return jsonDecode(response.body) as Map<String, dynamic>;
-  }
-
-  Future<void> _registerWithJanus() async {
-    if (_isRegistering) {
+  void _onSocketDone(WebSocket socket) {
+    if (!identical(socket, _socket)) {
       return;
     }
+
+    _handleConnectionLost(
+      'Janus WebSocket closed '
+      '(code ${socket.closeCode}, reason ${socket.closeReason}).',
+    );
+  }
+
+  void _handleConnectionLost(String reason) {
+    print('CONNECTION LOST: $reason');
+
+    _keepAliveTimer?.cancel();
+    _keepAliveTimer = null;
+
+    _socketSub?.cancel();
+    _socketSub = null;
+    _socket = null;
+
+    for (final completer in _pending.values) {
+      if (!completer.isCompleted) {
+        completer.completeError(Exception(reason));
+      }
+    }
+
+    _pending.clear();
+
+    final registration = _registrationCompleter;
+    if (registration != null && !registration.isCompleted) {
+      registration.completeError(Exception(reason));
+    }
+
+    unawaited(_disposeWebRtc());
+
+    if (!mounted) return;
+
+    setState(() {
+      _isRegistered = false;
+      _isCalling = false;
+      _isInCall = false;
+      _status = '$reason Register again.';
+    });
+  }
+
+  void _onSocketData(dynamic data) {
+    if (data is! String) {
+      print('DEBUG: Ignoring non-text WebSocket frame');
+      return;
+    }
+
+    print('DEBUG: WS <- $data');
+
+    Map<String, dynamic> message;
+
+    try {
+      message = jsonDecode(data) as Map<String, dynamic>;
+    } catch (error) {
+      print('DEBUG: Invalid JSON from Janus: $error');
+      return;
+    }
+
+    final type = message['janus'] as String?;
+    final transaction = message['transaction'] as String?;
+
+    if (transaction != null &&
+        (type == 'success' || type == 'error' || type == 'ack')) {
+      final pending = _pending.remove(transaction);
+
+      if (pending != null && !pending.isCompleted) {
+        pending.complete(message);
+        return;
+      }
+    }
+
+    _eventChain = _eventChain
+        .then((_) => _handleJanusMessage(message))
+        .catchError((Object error, StackTrace stackTrace) {
+      print('EVENT HANDLER ERROR: $error');
+      print(stackTrace);
+    });
+  }
+
+  Future<Map<String, dynamic>> _request(
+    Map<String, dynamic> payload, {
+    bool needSession = true,
+    bool needHandle = false,
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    final socket = _socket;
+
+    if (socket == null) {
+      throw Exception('Janus WebSocket is not connected');
+    }
+
+    final transaction = _randomTransaction();
+
+    final message = <String, dynamic>{
+      ...payload,
+      'transaction': transaction,
+    };
+
+    if (needSession) {
+      final sessionId = _sessionId;
+
+      if (sessionId == null) {
+        throw Exception('No Janus session');
+      }
+
+      message['session_id'] = sessionId;
+    }
+
+    if (needHandle) {
+      final handleId = _handleId;
+
+      if (handleId == null) {
+        throw Exception('No SIP plugin handle');
+      }
+
+      message['handle_id'] = handleId;
+    }
+
+    final completer = Completer<Map<String, dynamic>>();
+    _pending[transaction] = completer;
+
+    final bodyRequest = (message['body'] is Map)
+        ? (message['body'] as Map)['request']
+        : '';
+
+    print('DEBUG: WS -> ${message['janus']} $bodyRequest');
+
+    socket.add(jsonEncode(message));
+
+    try {
+      final response = await completer.future.timeout(timeout);
+
+      if (response['janus'] == 'error') {
+        final error = response['error'];
+        final code = error is Map ? error['code'] : '';
+        final reason = error is Map ? error['reason'] : error;
+
+        throw Exception('Janus error $code: $reason');
+      }
+
+      return response;
+    } on TimeoutException {
+      _pending.remove(transaction);
+
+      throw Exception(
+        'Janus did not answer "${payload['janus']}" within '
+        '${timeout.inSeconds}s',
+      );
+    }
+  }
+
+  void _sendNoWait(
+    Map<String, dynamic> payload, {
+    bool needHandle = false,
+  }) {
+    final socket = _socket;
+    final sessionId = _sessionId;
+
+    if (socket == null || sessionId == null) return;
+
+    final message = <String, dynamic>{
+      ...payload,
+      'transaction': _randomTransaction(),
+      'session_id': sessionId,
+    };
+
+    if (needHandle) {
+      final handleId = _handleId;
+
+      if (handleId == null) return;
+
+      message['handle_id'] = handleId;
+    }
+
+    socket.add(jsonEncode(message));
+  }
+
+  void _startKeepAlive() {
+    _keepAliveTimer?.cancel();
+
+    _keepAliveTimer = Timer.periodic(const Duration(seconds: 25), (_) {
+      print('DEBUG: sending Janus keepalive');
+      _sendNoWait({'janus': 'keepalive'});
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // SIP registration
+  // ---------------------------------------------------------------------------
+
+  Future<void> _registerWithJanus() async {
+    if (_isRegistering) return;
 
     setState(() {
       _isRegistering = true;
       _isRegistered = false;
       _isCalling = false;
       _isInCall = false;
-      _sessionId = null;
-      _handleId = null;
-      _status = 'Creating Janus session...';
+      _status = 'Connecting...';
     });
 
     try {
       await _disposeWebRtc();
+      await _closeWebSocket();
 
-      final sessionResponse = await _createJanusSession();
-      final sessionId = sessionResponse['data']['id'] as int;
-      _sessionId = sessionId;
+      _sessionId = null;
+      _handleId = null;
+
+      await _connectWebSocket();
+
+      _setStatus('Creating Janus session...');
+
+      final created = await _request(
+        {'janus': 'create'},
+        needSession: false,
+      );
+
+      _sessionId = created['data']['id'] as int;
+
+      _startKeepAlive();
 
       _setStatus('Attaching SIP plugin...');
 
-      final handleResponse = await _attachSipPlugin(sessionId: sessionId);
-      final handleId = handleResponse['data']['id'] as int;
-      _handleId = handleId;
+      final attached = await _request({
+        'janus': 'attach',
+        'plugin': 'janus.plugin.sip',
+      });
+
+      _handleId = attached['data']['id'] as int;
+
+      final registration = Completer<String>();
+      registration.future.ignore();
+      _registrationCompleter = registration;
 
       _setStatus('Sending SIP registration request...');
 
-      final registerResponse = await http
-          .post(
-            Uri.parse('$_janusBaseUrl/$sessionId/$handleId'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'janus': 'message',
-              'transaction': _randomTransaction(),
-              'body': {
-                'request': 'register',
-                'username':
-                    'sip:${_usernameController.text.trim()}@$_sipServer',
-                'authuser': _usernameController.text.trim(),
-                'display_name': 'Flutter SIP Client',
-                'secret': _passwordController.text,
-                'proxy': 'sip:$_sipServer:$_sipServerPort',
-              },
-            }),
-          )
-          .timeout(const Duration(seconds: 15));
-
-      print('DEBUG: Register status: ${registerResponse.statusCode}');
-      print('DEBUG: Register body: ${registerResponse.body}');
-
-      if (registerResponse.statusCode != 200) {
-        throw Exception(
-          'Register request failed: HTTP ${registerResponse.statusCode}',
-        );
-      }
-
-      final registerData =
-          jsonDecode(registerResponse.body) as Map<String, dynamic>;
-
-      if (registerData['janus'] != 'ack' &&
-          registerData['janus'] != 'success') {
-        throw Exception(
-          'Janus rejected registration: ${registerData['error']}',
-        );
-      }
+      await _request(
+        {
+          'janus': 'message',
+          'body': {
+            'request': 'register',
+            'username':
+                'sip:${_usernameController.text.trim()}@$_sipServer',
+            'authuser': _usernameController.text.trim(),
+            'display_name': 'Flutter SIP Client',
+            'secret': _passwordController.text,
+            'proxy': 'sip:$_sipServer:$_sipServerPort',
+          },
+        },
+        needHandle: true,
+      );
 
       _setStatus('Waiting for registration confirmation...');
 
-      String? registrationEvent;
+      final outcome = await registration.future.timeout(
+        const Duration(seconds: 15),
+      );
 
-      for (int attempt = 0; attempt < 10; attempt++) {
-        final eventData = await _getNextEvent();
-
-        final pluginData =
-            eventData['plugindata']?['data'] as Map<String, dynamic>?;
-
-        final resultData =
-            pluginData?['result'] as Map<String, dynamic>?;
-
-        registrationEvent = resultData?['event'] as String?;
-
-        print('DEBUG: Registration event: $registrationEvent');
-
-        if (registrationEvent == 'registered' ||
-            registrationEvent == 'registration_failed') {
-          break;
-        }
-      }
-
-      if (registrationEvent == 'registered') {
-        if (!mounted) {
-          return;
-        }
+      if (outcome == 'registered') {
+        if (!mounted) return;
 
         setState(() {
           _isRegistered = true;
-          _status =
-              'Registered as ${_usernameController.text.trim()}. '
-              'Ready to call or receive calls.';
+          _status = 'Registered as ${_usernameController.text.trim()} '
+              'over WebSocket. Ready to call or receive calls.';
         });
-
-        _startEventLoop();
       } else {
-        _setStatus(
-          'Registration was not confirmed. Final event: '
-          '${registrationEvent ?? 'none'}',
-        );
+        _setStatus('Registration was not confirmed: $outcome');
+        await _closeWebSocket();
       }
     } on TimeoutException {
       _setStatus('Registration timed out waiting for Janus.');
+      await _closeWebSocket();
     } catch (error, stackTrace) {
       print('REGISTER ERROR: $error');
       print(stackTrace);
+
       _setStatus('Registration failed: $error');
+      await _closeWebSocket();
     } finally {
+      _registrationCompleter = null;
+
       if (mounted) {
         setState(() {
           _isRegistering = false;
@@ -329,10 +471,12 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // WebRTC
+  // ---------------------------------------------------------------------------
+
   Future<void> _ensureMicrophoneAndPeerConnection() async {
-    if (_peerConnection != null && _localStream != null) {
-      return;
-    }
+    if (_peerConnection != null && _localStream != null) return;
 
     _setStatus('Requesting microphone permission...');
 
@@ -353,9 +497,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
     for (final track in audioTracks) {
       print(
-        'DEBUG: mic track '
-        'id=${track.id}, '
-        'kind=${track.kind}, '
+        'DEBUG: mic track id=${track.id}, kind=${track.kind}, '
         'enabled=${track.enabled}',
       );
     }
@@ -377,7 +519,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
     peerConnection.onIceCandidate = (candidate) {
       if (candidate != null) {
-        unawaited(_sendIceCandidate(candidate));
+        _sendIceCandidate(candidate);
       }
     };
 
@@ -407,12 +549,66 @@ class _MyHomePageState extends State<MyHomePage> {
 
     for (final sender in senders) {
       print(
-        'DEBUG: RTP sender '
-        'track=${sender.track?.kind}, '
+        'DEBUG: RTP sender track=${sender.track?.kind}, '
         'enabled=${sender.track?.enabled}',
       );
     }
   }
+
+  void _sendIceCandidate(RTCIceCandidate candidate) {
+    _sendNoWait(
+      {
+        'janus': 'trickle',
+        'candidate': {
+          'candidate': candidate.candidate,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex': candidate.sdpMLineIndex,
+        },
+      },
+      needHandle: true,
+    );
+
+    print('DEBUG: ICE candidate sent: ${candidate.candidate}');
+  }
+
+  Future<void> _applyRemoteAnswer(Map<String, dynamic> jsep) async {
+    final peerConnection = _peerConnection;
+
+    if (peerConnection == null) {
+      _setStatus('Remote SDP arrived, but no WebRTC PeerConnection exists.');
+      return;
+    }
+
+    final type = jsep['type'] as String?;
+    final sdp = jsep['sdp'] as String?;
+
+    if (type == null || sdp == null) {
+      _setStatus('Janus sent no usable SDP answer.');
+      return;
+    }
+
+    await peerConnection.setRemoteDescription(
+      RTCSessionDescription(sdp, type),
+    );
+
+    _setStatus('Remote SDP applied. Establishing audio...');
+  }
+
+  Future<void> _disposeWebRtc() async {
+    try {
+      await _localStream?.dispose();
+      await _peerConnection?.close();
+    } catch (error) {
+      print('WebRTC cleanup warning: $error');
+    }
+
+    _localStream = null;
+    _peerConnection = null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Outgoing call
+  // ---------------------------------------------------------------------------
 
   Future<void> _startCall() async {
     final destination = _destinationSipUser;
@@ -427,9 +623,7 @@ class _MyHomePageState extends State<MyHomePage> {
       return;
     }
 
-    if (_isCalling || _isInCall) {
-      return;
-    }
+    if (_isCalling || _isInCall) return;
 
     setState(() {
       _isCalling = true;
@@ -460,43 +654,23 @@ class _MyHomePageState extends State<MyHomePage> {
 
       _setStatus('Sending SIP INVITE through Janus...');
 
-      final response = await http
-          .post(
-            Uri.parse('$_janusBaseUrl/$_sessionId/$_handleId'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'janus': 'message',
-              'transaction': _randomTransaction(),
-              'body': {
-                'request': 'call',
-                'uri': 'sip:$destination@$_sipServer:$_sipServerPort',
-              },
-              'jsep': {
-                'type': localDescription.type,
-                'sdp': localDescription.sdp,
-              },
-            }),
-          )
-          .timeout(const Duration(seconds: 15));
+      await _request(
+        {
+          'janus': 'message',
+          'body': {
+            'request': 'call',
+            'uri': 'sip:$destination@$_sipServer:$_sipServerPort',
+          },
+          'jsep': {
+            'type': localDescription.type,
+            'sdp': localDescription.sdp,
+          },
+        },
+        needHandle: true,
+        timeout: const Duration(seconds: 15),
+      );
 
-      print('DEBUG: Call status: ${response.statusCode}');
-      print('DEBUG: Call body: ${response.body}');
-
-      if (response.statusCode != 200) {
-        throw Exception(
-          'Janus call request failed: HTTP ${response.statusCode}',
-        );
-      }
-
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-
-      if (data['janus'] != 'ack' && data['janus'] != 'success') {
-        throw Exception('Janus rejected call request: ${data['error']}');
-      }
-
-      if (!mounted) {
-        return;
-      }
+      if (!mounted) return;
 
       setState(() {
         _isCalling = true;
@@ -519,152 +693,177 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  void _startEventLoop() {
-    if (_eventLoopRunning || !_isRegistered) {
+  // ---------------------------------------------------------------------------
+  // Incoming Janus events
+  // ---------------------------------------------------------------------------
+
+  Future<void> _handleJanusMessage(Map<String, dynamic> message) async {
+    final type = message['janus'] as String?;
+
+    if (type == 'timeout') {
+      unawaited(_closeWebSocket());
+      _handleConnectionLost('Janus session timed out.');
       return;
     }
 
-    _eventLoopRunning = true;
-    unawaited(_eventLoop());
-  }
-
-  Future<void> _eventLoop() async {
-    while (_isRegistered) {
-      try {
-        final eventData = await _getNextEvent();
-
-        final pluginData =
-            eventData['plugindata']?['data'] as Map<String, dynamic>?;
-
-        if (pluginData == null) {
-          continue;
-        }
-
-        final resultData = pluginData['result'] as Map<String, dynamic>?;
-
-        if (resultData == null) {
-          continue;
-        }
-
-        final event = resultData['event'] as String?;
-
-        print('DEBUG: SIP event: $event');
-        print(
-          'DEBUG: SIP event data: '
-          '${const JsonEncoder.withIndent('  ').convert(resultData)}',
-        );
-
-        if (event == 'hangup' && _incomingCallVisible) {
-          _dismissIncomingDialogBecauseCallerHungUp();
-          continue;
-        }
-
-        if (event == 'incomingcall') {
-          final jsep = eventData['jsep'] as Map<String, dynamic>?;
-          final callerUri = resultData['username'] as String? ?? '';
-          final callerExtension = _extractExtension(callerUri);
-
-          unawaited(
-            _handleIncomingCall(jsep, callerExtension),
-          );
-          continue;
-        }
-
-        if (event == 'calling') {
-          if (mounted) {
-            setState(() {
-              _isCalling = true;
-              _isInCall = false;
-              _status = 'Calling $_destinationSipUser...';
-            });
-          }
-          continue;
-        }
-
-        final jsep = eventData['jsep'] as Map<String, dynamic>?;
-
-        if (event == 'proceeding') {
-          if (jsep != null) {
-            await _applyRemoteAnswer(jsep);
-          }
-
-          if (mounted) {
-            setState(() {
-              _isCalling = true;
-              _isInCall = false;
-              _status = 'Call proceeding. Waiting for answer...';
-            });
-          }
-          continue;
-        }
-
-        if (event == 'progress') {
-          if (jsep != null) {
-            await _applyRemoteAnswer(jsep);
-          }
-
-          if (mounted) {
-            setState(() {
-              _isCalling = true;
-              _isInCall = false;
-              _status = 'Call progressing. Waiting for answer...';
-            });
-          }
-          continue;
-        }
-
-        if (event == 'ringing') {
-          if (mounted) {
-            setState(() {
-              _isCalling = true;
-              _isInCall = false;
-              _status = 'Ringing $_destinationSipUser...';
-            });
-          }
-          continue;
-        }
-
-        if (event == 'accepted') {
-          if (jsep != null) {
-            await _applyRemoteAnswer(jsep);
-          }
-
-          if (mounted) {
-            setState(() {
-              _isCalling = false;
-              _isInCall = true;
-              _status = 'Call accepted. Connecting audio...';
-            });
-          }
-          continue;
-        }
-
-        if (event == 'hangup') {
-          await _handleRemoteHangup(resultData);
-        }
-      } on TimeoutException {
-        // Normal behavior for a Janus REST long-poll when there are no events.
-        // Immediately create the next long-poll request.
-        continue;
-      } catch (error, stackTrace) {
-        print('EVENT LOOP ERROR: $error');
-        print(stackTrace);
-
-        if (!_isRegistered) {
-          break;
-        }
-
-        await Future<void>.delayed(const Duration(seconds: 1));
-      }
+    if (type != 'event') {
+      return;
     }
 
-    _eventLoopRunning = false;
+    final pluginData = message['plugindata'];
+
+    if (pluginData is! Map) return;
+
+    final data = pluginData['data'];
+
+    if (data is! Map) return;
+
+    final pluginError = data['error'];
+
+    if (pluginError != null) {
+      final text = 'SIP plugin error ${data['error_code'] ?? ''}: '
+          '$pluginError';
+
+      print('PLUGIN ERROR: $text');
+
+      final registration = _registrationCompleter;
+
+      if (registration != null && !registration.isCompleted) {
+        registration.completeError(Exception(text));
+        return;
+      }
+
+      await _disposeWebRtc();
+
+      if (mounted) {
+        setState(() {
+          _isCalling = false;
+          _isInCall = false;
+          _status = text;
+        });
+      }
+
+      return;
+    }
+
+    final result = data['result'];
+
+    if (result is! Map) return;
+
+    final resultData = Map<String, dynamic>.from(result);
+    final event = resultData['event'] as String?;
+
+    final jsepRaw = message['jsep'];
+    final jsep =
+        jsepRaw is Map ? Map<String, dynamic>.from(jsepRaw) : null;
+
+    print('DEBUG: SIP event: $event');
+
+    if (event == 'registering') {
+      _setStatus('SIP registering...');
+      return;
+    }
+
+    if (event == 'registered' || event == 'registration_failed') {
+      final registration = _registrationCompleter;
+
+      if (registration != null && !registration.isCompleted) {
+        registration.complete(event!);
+      } else if (event == 'registration_failed') {
+        if (mounted) {
+          setState(() {
+            _isRegistered = false;
+            _status = 'SIP registration failed: '
+                '${resultData['code']} ${resultData['reason']}';
+          });
+        }
+      }
+
+      return;
+    }
+
+    if (event == 'hangup' && _incomingCallVisible) {
+      _dismissIncomingDialogBecauseCallerHungUp();
+      return;
+    }
+
+    if (event == 'incomingcall') {
+      final callerUri = resultData['username'] as String? ?? '';
+      final callerExtension = _extractExtension(callerUri);
+
+      unawaited(_handleIncomingCall(jsep, callerExtension));
+      return;
+    }
+
+    if (event == 'calling') {
+      if (mounted) {
+        setState(() {
+          _isCalling = true;
+          _isInCall = false;
+          _status = 'Calling $_destinationSipUser...';
+        });
+      }
+
+      return;
+    }
+
+    if (event == 'proceeding' || event == 'progress') {
+      if (jsep != null) {
+        await _applyRemoteAnswer(jsep);
+      }
+
+      if (mounted) {
+        setState(() {
+          _isCalling = true;
+          _isInCall = false;
+          _status = 'Call progressing. Waiting for answer...';
+        });
+      }
+
+      return;
+    }
+
+    if (event == 'ringing') {
+      if (mounted) {
+        setState(() {
+          _isCalling = true;
+          _isInCall = false;
+          _status = 'Ringing $_destinationSipUser...';
+        });
+      }
+
+      return;
+    }
+
+    if (event == 'accepted') {
+      if (jsep != null) {
+        await _applyRemoteAnswer(jsep);
+      }
+
+      if (mounted) {
+        setState(() {
+          _isCalling = false;
+          _isInCall = true;
+          _status = 'Call accepted. Connecting audio...';
+        });
+      }
+
+      return;
+    }
+
+    if (event == 'hangup') {
+      await _handleRemoteHangup(resultData);
+    }
   }
 
   String _extractExtension(String sipUri) {
     final match = RegExp(r'sip:([^@]+)@').firstMatch(sipUri);
     return match?.group(1) ?? 'Unknown';
   }
+
+  // ---------------------------------------------------------------------------
+  // Incoming call
+  // ---------------------------------------------------------------------------
 
   void _dismissIncomingDialogBecauseCallerHungUp() {
     print('DEBUG: Caller hung up before the call was answered.');
@@ -699,9 +898,9 @@ class _MyHomePageState extends State<MyHomePage> {
       _incomingCancelledByCaller = false;
 
       _setStatus(
-        'Missed call from extension: $callerExtension '
-        '(caller cancelled).',
+        'Missed call from extension: $callerExtension (caller cancelled).',
       );
+
       return;
     }
 
@@ -754,38 +953,18 @@ class _MyHomePageState extends State<MyHomePage> {
 
       _setStatus('Sending call acceptance to Janus...');
 
-      final response = await http
-          .post(
-            Uri.parse('$_janusBaseUrl/$_sessionId/$_handleId'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'janus': 'message',
-              'transaction': _randomTransaction(),
-              'body': {
-                'request': 'accept',
-              },
-              'jsep': {
-                'type': localDescription.type,
-                'sdp': localDescription.sdp,
-              },
-            }),
-          )
-          .timeout(const Duration(seconds: 15));
-
-      print('DEBUG: Accept status: ${response.statusCode}');
-      print('DEBUG: Accept body: ${response.body}');
-
-      if (response.statusCode != 200) {
-        throw Exception(
-          'Failed to accept incoming call: HTTP ${response.statusCode}',
-        );
-      }
-
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-
-      if (data['janus'] != 'ack' && data['janus'] != 'success') {
-        throw Exception('Janus rejected call accept: ${data['error']}');
-      }
+      await _request(
+        {
+          'janus': 'message',
+          'body': {'request': 'accept'},
+          'jsep': {
+            'type': localDescription.type,
+            'sdp': localDescription.sdp,
+          },
+        },
+        needHandle: true,
+        timeout: const Duration(seconds: 15),
+      );
 
       if (mounted) {
         setState(() {
@@ -810,12 +989,8 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  Future<bool> _showIncomingCallDialog(
-    String callerExtension,
-  ) async {
-    if (!mounted) {
-      return false;
-    }
+  Future<bool> _showIncomingCallDialog(String callerExtension) async {
+    if (!mounted) return false;
 
     final result = await showDialog<bool>(
       context: context,
@@ -831,15 +1006,11 @@ class _MyHomePageState extends State<MyHomePage> {
           ),
           actions: [
             TextButton(
-              onPressed: () {
-                Navigator.of(dialogContext).pop(false);
-              },
+              onPressed: () => Navigator.of(dialogContext).pop(false),
               child: const Text('Reject'),
             ),
             ElevatedButton(
-              onPressed: () {
-                Navigator.of(dialogContext).pop(true);
-              },
+              onPressed: () => Navigator.of(dialogContext).pop(true),
               child: const Text('Accept'),
             ),
           ],
@@ -852,94 +1023,29 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Future<void> _declineIncomingCall() async {
     try {
-      final response = await http.post(
-        Uri.parse('$_janusBaseUrl/$_sessionId/$_handleId'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
+      await _request(
+        {
           'janus': 'message',
-          'transaction': _randomTransaction(),
-          'body': {
-            'request': 'decline',
-          },
-        }),
+          'body': {'request': 'decline'},
+        },
+        needHandle: true,
       );
-
-      print('DEBUG: Decline status: ${response.statusCode}');
-      print('DEBUG: Decline body: ${response.body}');
 
       _setStatus('Incoming call rejected.');
     } catch (error, stackTrace) {
       print('DECLINE ERROR: $error');
       print(stackTrace);
+
       _setStatus('Could not reject incoming call: $error');
     }
   }
 
-  Future<void> _applyRemoteAnswer(
-    Map<String, dynamic> jsep,
-  ) async {
-    final peerConnection = _peerConnection;
+  // ---------------------------------------------------------------------------
+  // Hang up
+  // ---------------------------------------------------------------------------
 
-    if (peerConnection == null) {
-      _setStatus('Remote SDP arrived, but no WebRTC PeerConnection exists.');
-      return;
-    }
-
-    final type = jsep['type'] as String?;
-    final sdp = jsep['sdp'] as String?;
-
-    if (type == null || sdp == null) {
-      _setStatus('Janus sent no usable SDP answer.');
-      return;
-    }
-
-    await peerConnection.setRemoteDescription(
-      RTCSessionDescription(sdp, type),
-    );
-
-    _setStatus('Remote SDP applied. Establishing audio...');
-  }
-
-  Future<void> _sendIceCandidate(RTCIceCandidate candidate) async {
-    try {
-      final sessionId = _sessionId;
-      final handleId = _handleId;
-
-      if (sessionId == null || handleId == null) {
-        return;
-      }
-
-      final response = await http.post(
-        Uri.parse('$_janusBaseUrl/$sessionId/$handleId'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'janus': 'trickle',
-          'transaction': _randomTransaction(),
-          'candidate': {
-            'candidate': candidate.candidate,
-            'sdpMid': candidate.sdpMid,
-            'sdpMLineIndex': candidate.sdpMLineIndex,
-          },
-        }),
-      );
-
-      print(
-        'DEBUG: ICE candidate sent: '
-        '${candidate.candidate} '
-        'HTTP ${response.statusCode}',
-      );
-    } catch (error, stackTrace) {
-      print('ICE CANDIDATE ERROR: $error');
-      print(stackTrace);
-    }
-  }
-
-  Future<void> _handleRemoteHangup(
-    Map<String, dynamic> resultData,
-  ) async {
-    if (_processingRemoteHangup) {
-      return;
-    }
+  Future<void> _handleRemoteHangup(Map<String, dynamic> resultData) async {
+    if (_processingRemoteHangup) return;
 
     _processingRemoteHangup = true;
 
@@ -963,29 +1069,17 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _hangup() async {
-    if (_processingRemoteHangup) {
-      return;
-    }
+    if (_processingRemoteHangup) return;
 
-    final sessionId = _sessionId;
-    final handleId = _handleId;
-
-    if (sessionId != null && handleId != null) {
+    if (_socket != null && _handleId != null) {
       try {
-        final response = await http.post(
-          Uri.parse('$_janusBaseUrl/$sessionId/$handleId'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
+        await _request(
+          {
             'janus': 'message',
-            'transaction': _randomTransaction(),
-            'body': {
-              'request': 'hangup',
-            },
-          }),
+            'body': {'request': 'hangup'},
+          },
+          needHandle: true,
         );
-
-        print('DEBUG: Hangup status: ${response.statusCode}');
-        print('DEBUG: Hangup body: ${response.body}');
       } catch (error, stackTrace) {
         print('HANGUP ERROR: $error');
         print(stackTrace);
@@ -1003,17 +1097,9 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  Future<void> _disposeWebRtc() async {
-    try {
-      await _localStream?.dispose();
-      await _peerConnection?.close();
-    } catch (error) {
-      print('WebRTC cleanup warning: $error');
-    }
-
-    _localStream = null;
-    _peerConnection = null;
-  }
+  // ---------------------------------------------------------------------------
+  // UI
+  // ---------------------------------------------------------------------------
 
   Widget _buildInput({
     required TextEditingController controller,
@@ -1039,7 +1125,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Janus SIP Demo'),
+        title: const Text('Janus SIP Demo (WebSocket)'),
       ),
       body: SafeArea(
         child: SingleChildScrollView(
@@ -1056,7 +1142,7 @@ class _MyHomePageState extends State<MyHomePage> {
               const SizedBox(height: 12),
               _buildInput(
                 controller: _janusPortController,
-                label: 'Janus HTTP port',
+                label: 'Janus WebSocket port (default 8188)',
                 keyboardType: TextInputType.number,
               ),
               const SizedBox(height: 12),
@@ -1159,20 +1245,18 @@ class _MyHomePageState extends State<MyHomePage> {
                       const Divider(),
                       const SizedBox(height: 8),
                       SelectableText(
-                        'Janus session ID: ${_sessionId ?? 'none'}',
+                        'Transport: WebSocket '
+                        '(${_socket != null ? 'connected' : 'disconnected'})',
                       ),
                       SelectableText(
-                        'SIP handle ID: ${_handleId ?? 'none'}',
+                        'Janus session ID: ${_sessionId ?? 'none'}',
                       ),
+                      SelectableText('SIP handle ID: ${_handleId ?? 'none'}'),
                       SelectableText(
                         'Registered: ${_isRegistered ? 'yes' : 'no'}',
                       ),
-                      SelectableText(
-                        'In call: ${_isInCall ? 'yes' : 'no'}',
-                      ),
-                      SelectableText(
-                        'Calling: ${_isCalling ? 'yes' : 'no'}',
-                      ),
+                      SelectableText('In call: ${_isInCall ? 'yes' : 'no'}'),
+                      SelectableText('Calling: ${_isCalling ? 'yes' : 'no'}'),
                     ],
                   ),
                 ),
