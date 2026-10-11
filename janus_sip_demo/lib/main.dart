@@ -56,6 +56,10 @@ class _MyHomePageState extends State<MyHomePage> {
   BuildContext? _incomingDialogContext;
   bool _processingRemoteHangup = false;
 
+  // In-call controls
+  bool _isMuted = false;
+  bool _isSpeakerOn = false;
+
   int? _sessionId;
   int? _handleId;
 
@@ -83,6 +87,10 @@ class _MyHomePageState extends State<MyHomePage> {
       int.tryParse(_sipPortController.text.trim()) ?? 5060;
 
   String get _destinationSipUser => _destinationController.text.trim();
+
+  bool get _isMobile => Platform.isAndroid || Platform.isIOS;
+
+  bool get _showCallControls => _isCalling || _isInCall;
 
   @override
   void dispose() {
@@ -115,6 +123,53 @@ class _MyHomePageState extends State<MyHomePage> {
   String _randomTransaction() {
     _transactionCounter++;
     return '${DateTime.now().microsecondsSinceEpoch}-$_transactionCounter';
+  }
+
+  // ---------------------------------------------------------------------------
+  // In-call controls: mute and loudspeaker
+  // ---------------------------------------------------------------------------
+
+  void _applyMute() {
+    final stream = _localStream;
+
+    if (stream == null) return;
+
+    for (final track in stream.getAudioTracks()) {
+      track.enabled = !_isMuted;
+    }
+
+    print('DEBUG: Microphone ${_isMuted ? 'muted' : 'unmuted'}');
+  }
+
+  Future<void> _applySpeaker() async {
+    if (!_isMobile) return;
+
+    try {
+      await Helper.setSpeakerphoneOn(_isSpeakerOn);
+      print('DEBUG: Loudspeaker ${_isSpeakerOn ? 'ON' : 'OFF'}');
+    } catch (error) {
+      print('Speakerphone warning: $error');
+    }
+  }
+
+  Future<void> _toggleMute() async {
+    if (!mounted) return;
+
+    setState(() {
+      _isMuted = !_isMuted;
+    });
+
+    _applyMute();
+  }
+
+  Future<void> _toggleSpeaker() async {
+    if (!mounted) return;
+
+    setState(() {
+      _isSpeakerOn = !_isSpeakerOn;
+    });
+
+    await _applySpeaker();
   }
 
   // ---------------------------------------------------------------------------
@@ -218,6 +273,8 @@ class _MyHomePageState extends State<MyHomePage> {
       _isRegistered = false;
       _isCalling = false;
       _isInCall = false;
+      _isMuted = false;
+      _isSpeakerOn = false;
       _status = '$reason Register again.';
     });
   }
@@ -506,6 +563,9 @@ class _MyHomePageState extends State<MyHomePage> {
       throw Exception('No microphone audio track was returned.');
     }
 
+    // Apply a mute choice made before the microphone was ready.
+    _applyMute();
+
     _setStatus('Creating WebRTC PeerConnection...');
 
     final peerConnection = await createPeerConnection({
@@ -528,6 +588,8 @@ class _MyHomePageState extends State<MyHomePage> {
 
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
         _setStatus('WebRTC connected. Audio should be active.');
+        // Re-apply the audio route once audio is flowing.
+        unawaited(_applySpeaker());
       } else if (state ==
           RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
         _setStatus('Call failed: WebRTC connection failed.');
@@ -553,6 +615,9 @@ class _MyHomePageState extends State<MyHomePage> {
         'enabled=${sender.track?.enabled}',
       );
     }
+
+    // Start every call on the earpiece unless the user already chose speaker.
+    await _applySpeaker();
   }
 
   void _sendIceCandidate(RTCIceCandidate candidate) {
@@ -595,6 +660,10 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _disposeWebRtc() async {
+    // Reset in-call controls synchronously so the UI never shows stale state.
+    _isMuted = false;
+    _isSpeakerOn = false;
+
     try {
       await _localStream?.dispose();
       await _peerConnection?.close();
@@ -625,9 +694,12 @@ class _MyHomePageState extends State<MyHomePage> {
 
     if (_isCalling || _isInCall) return;
 
+    // Controls appear immediately after Call is pressed.
     setState(() {
       _isCalling = true;
       _isInCall = false;
+      _isMuted = false;
+      _isSpeakerOn = false;
       _status = 'Preparing microphone and WebRTC...';
     });
 
@@ -687,6 +759,8 @@ class _MyHomePageState extends State<MyHomePage> {
         setState(() {
           _isCalling = false;
           _isInCall = false;
+          _isMuted = false;
+          _isSpeakerOn = false;
           _status = 'Call failed: $error';
         });
       }
@@ -733,15 +807,18 @@ class _MyHomePageState extends State<MyHomePage> {
         return;
       }
 
-      await _disposeWebRtc();
-
+      // Hide the call controls immediately, then clean up.
       if (mounted) {
         setState(() {
           _isCalling = false;
           _isInCall = false;
+          _isMuted = false;
+          _isSpeakerOn = false;
           _status = text;
         });
       }
+
+      await _disposeWebRtc();
 
       return;
     }
@@ -914,9 +991,12 @@ class _MyHomePageState extends State<MyHomePage> {
         throw Exception('Incoming call has no SDP offer.');
       }
 
+      // Controls appear on the receiver only after Accept is pressed.
       setState(() {
         _isCalling = true;
         _isInCall = false;
+        _isMuted = false;
+        _isSpeakerOn = false;
         _status = 'Accepting incoming call...';
       });
 
@@ -983,6 +1063,8 @@ class _MyHomePageState extends State<MyHomePage> {
         setState(() {
           _isInCall = false;
           _isCalling = false;
+          _isMuted = false;
+          _isSpeakerOn = false;
           _status = 'Incoming call failed: $error';
         });
       }
@@ -1054,22 +1136,36 @@ class _MyHomePageState extends State<MyHomePage> {
 
     print('DEBUG: Remote hangup. Code: $code, reason: $reason');
 
-    await _disposeWebRtc();
-
+    // Hide the call controls immediately.
     if (mounted) {
       setState(() {
         _isCalling = false;
         _isInCall = false;
+        _isMuted = false;
+        _isSpeakerOn = false;
         _status = 'Call ended — code: ${code ?? 'unknown'}, '
             'reason: ${reason ?? 'unknown'}.';
       });
     }
+
+    await _disposeWebRtc();
 
     _processingRemoteHangup = false;
   }
 
   Future<void> _hangup() async {
     if (_processingRemoteHangup) return;
+
+    // Hide the call controls immediately.
+    if (mounted) {
+      setState(() {
+        _isCalling = false;
+        _isInCall = false;
+        _isMuted = false;
+        _isSpeakerOn = false;
+        _status = 'Ending call...';
+      });
+    }
 
     if (_socket != null && _handleId != null) {
       try {
@@ -1090,8 +1186,6 @@ class _MyHomePageState extends State<MyHomePage> {
 
     if (mounted) {
       setState(() {
-        _isCalling = false;
-        _isInCall = false;
         _status = 'Call ended locally. Ready for another call.';
       });
     }
@@ -1116,6 +1210,36 @@ class _MyHomePageState extends State<MyHomePage> {
         labelText: label,
         border: const OutlineInputBorder(),
       ),
+    );
+  }
+
+  Widget _buildCallControls() {
+    return Row(
+      children: [
+        Expanded(
+          child: ElevatedButton.icon(
+            onPressed: _toggleMute,
+            icon: Icon(_isMuted ? Icons.mic_off : Icons.mic),
+            label: Text(_isMuted ? 'Unmute' : 'Mute'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _isMuted ? Colors.orange : null,
+              foregroundColor: _isMuted ? Colors.white : null,
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: ElevatedButton.icon(
+            onPressed: _isMobile ? _toggleSpeaker : null,
+            icon: Icon(_isSpeakerOn ? Icons.volume_up : Icons.hearing),
+            label: Text(_isSpeakerOn ? 'Speaker On' : 'Speaker Off'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _isSpeakerOn ? Colors.green : null,
+              foregroundColor: _isSpeakerOn ? Colors.white : null,
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -1226,6 +1350,10 @@ class _MyHomePageState extends State<MyHomePage> {
                     ),
                   ],
                 ),
+                if (_showCallControls) ...[
+                  const SizedBox(height: 12),
+                  _buildCallControls(),
+                ],
               ],
               const SizedBox(height: 24),
               Card(
@@ -1257,6 +1385,13 @@ class _MyHomePageState extends State<MyHomePage> {
                       ),
                       SelectableText('In call: ${_isInCall ? 'yes' : 'no'}'),
                       SelectableText('Calling: ${_isCalling ? 'yes' : 'no'}'),
+                      SelectableText(
+                        'Microphone: ${_isMuted ? 'muted' : 'live'}',
+                      ),
+                      SelectableText(
+                        'Audio output: '
+                        '${_isSpeakerOn ? 'loudspeaker' : 'earpiece'}',
+                      ),
                     ],
                   ),
                 ),
