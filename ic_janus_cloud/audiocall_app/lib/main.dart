@@ -18,10 +18,6 @@
 //   flutter run -d linux    --dart-define=IC_USER=Sazid
 // Servers on the internet (one is enough, more are tried in case one is down):
 //   --dart-define=IC_SEEDS=203.0.113.10,203.0.113.11   (host or host:port)
-// Every server the app learns about (its public_host) is REMEMBERED on the
-// device and asked too on the next start, so new servers are found without a
-// new build, and the app still finds them when all the built-in seeds are down.
-// If the least busy server can't be joined, the next one is tried.
 //
 //   Audio calls: custom janus.plugin.audiocall plugin. Audio only (no camera).
 //   Video calls: custom janus.plugin.customvideocall plugin (built from the
@@ -40,7 +36,6 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 // ignore_for_file: avoid_print
 
@@ -58,100 +53,19 @@ const String kUsername = String.fromEnvironment('IC_USER');
 const String kSeeds = String.fromEnvironment('IC_SEEDS');
 const String kSeedServer = String.fromEnvironment('IC_SEED');
 
-/// "host" or "host:port" -> (host, port); the port defaults to 8188.
-(String, int)? parseHostPort(String entry) {
-  final text = entry.trim();
-  if (text.isEmpty) return null;
-  final colon = text.lastIndexOf(':');
-  final port = colon > 0 ? int.tryParse(text.substring(colon + 1)) : null;
-  final host = port != null ? text.substring(0, colon) : text;
-  return host.isEmpty ? null : (host, port ?? 8188);
-}
-
 /// The seed servers from IC_SEEDS and IC_SEED, as (host, port).
 List<(String, int)> parseSeeds() {
   final seeds = <(String, int)>[];
   for (final entry in '$kSeeds,$kSeedServer'.split(',')) {
-    final seed = parseHostPort(entry);
-    if (seed != null && !seeds.contains(seed)) seeds.add(seed);
+    final text = entry.trim();
+    if (text.isEmpty) continue;
+    final colon = text.lastIndexOf(':');
+    final port = colon > 0 ? int.tryParse(text.substring(colon + 1)) : null;
+    final host = port != null ? text.substring(0, colon) : text;
+    final seed = (host, port ?? 8188);
+    if (!seeds.contains(seed)) seeds.add(seed);
   }
   return seeds;
-}
-
-/// The servers this app has learned about (their public address and
-/// WebSocket port), remembered on the device. They are asked on start like
-/// the built-in seeds, so the app finds new servers without a new build and
-/// keeps working when every built-in seed is down. A server not seen for 30
-/// days is forgotten.
-class KnownServers {
-  static const String _key = 'ic_known_servers';
-  static const Duration _maxAge = Duration(days: 30);
-  static const int _maxEntries = 30;
-  static final Map<String, int> _lastSeen = {}; // "host:port" -> milliseconds
-  static bool _loaded = false;
-  static Timer? _saveTimer;
-
-  static Future<void> load() async {
-    if (_loaded) return;
-    _loaded = true;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_key);
-      if (raw == null) return;
-      final decoded = jsonDecode(raw);
-      if (decoded is Map) {
-        decoded.forEach((key, value) {
-          if (value is num) _lastSeen[key.toString()] = value.toInt();
-        });
-      }
-    } catch (error) {
-      print('KNOWN SERVERS: could not load: $error');
-    }
-  }
-
-  /// The remembered servers, most recently seen first.
-  static List<(String, int)> get all {
-    final cutoff = DateTime.now().subtract(_maxAge).millisecondsSinceEpoch;
-    final entries = _lastSeen.entries.where((e) => e.value >= cutoff).toList()
-      ..sort((a, b) => b.value.compareTo(a.value));
-    final servers = <(String, int)>[];
-    for (final entry in entries.take(_maxEntries)) {
-      final server = parseHostPort(entry.key);
-      if (server != null) servers.add(server);
-    }
-    return servers;
-  }
-
-  /// Remembers a server that was just seen (saved a moment later).
-  static void remember(String host, int port) {
-    if (host.isEmpty || host == '?') return;
-    final key = '$host:$port';
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final before = _lastSeen[key];
-    _lastSeen[key] = now;
-    if (before == null || now - before > 60000) _scheduleSave();
-  }
-
-  static void _scheduleSave() {
-    _saveTimer?.cancel();
-    _saveTimer = Timer(const Duration(seconds: 2), () async {
-      try {
-        final keep = <String, int>{};
-        for (final (host, port) in all) {
-          final key = '$host:$port';
-          keep[key] = _lastSeen[key]!;
-        }
-        _lastSeen
-          ..clear()
-          ..addAll(keep);
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString(_key, jsonEncode(_lastSeen));
-        print('KNOWN SERVERS: saved ${keep.keys.join(', ')}');
-      } catch (error) {
-        print('KNOWN SERVERS: could not save: $error');
-      }
-    });
-  }
 }
 
 /// UDP port the AudioCall plugin answers "discover" on (its link port).
@@ -159,16 +73,12 @@ const int kDiscoveryPort = 7088;
 
 /// A Janus server found on the LAN or through a seed server.
 class FoundServer {
-  const FoundServer(this.name, this.host, this.port, this.users,
-      {this.isPublic = false});
+  const FoundServer(this.name, this.host, this.port, this.users);
 
   final String name;
   final String host;
   final int port;
   final int users;
-
-  /// [host] is the server's public address (worth remembering), not a LAN one.
-  final bool isPublic;
 }
 const String kAudioPlugin = 'janus.plugin.audiocall';
 const String kVideoPlugin = 'janus.plugin.customvideocall';
@@ -221,7 +131,6 @@ class _CallPageState extends State<CallPage> {
   int _janusPort = 8188;
   String? _assignedServer;
   String _serversSummary = '';
-  String _seedsSummary = '';
   Timer? _reconnectTimer;
   bool _disposed = false;
 
@@ -346,7 +255,7 @@ class _CallPageState extends State<CallPage> {
     final socket = await WebSocket.connect(
       url,
       protocols: ['janus-protocol'],
-    ).timeout(const Duration(seconds: 6));
+    ).timeout(const Duration(seconds: 10));
     socket.pingInterval = const Duration(seconds: 20);
     _socket = socket;
 
@@ -734,7 +643,6 @@ class _CallPageState extends State<CallPage> {
         (r['public_host'] ?? seedHost).toString(),
         (r['ws_port'] as num?)?.toInt() ?? seedPort,
         count(r['list']),
-        isPublic: true, // its public_host, or the seed address we reached it at
       ));
     }
     if (r['servers'] is List) {
@@ -747,7 +655,6 @@ class _CallPageState extends State<CallPage> {
           host,
           (s['ws_port'] as num?)?.toInt() ?? 8188,
           count(s['users']),
-          isPublic: s['public_host'] != null,
         ));
       }
     }
@@ -758,16 +665,7 @@ class _CallPageState extends State<CallPage> {
   /// LAN broadcast, at the same time. A server found on the LAN keeps its LAN
   /// address (always reachable from here); the others use their public_host.
   Future<List<FoundServer>> _findServers() async {
-    await KnownServers.load();
-    final builtIn = parseSeeds();
-    final seeds = <(String, int)>[...builtIn];
-    for (final known in KnownServers.all) {
-      if (!seeds.contains(known)) seeds.add(known);
-    }
-    _seedsSummary = 'built-in ${builtIn.length}, '
-        'remembered ${seeds.length - builtIn.length}';
-    print('SEEDS: $_seedsSummary: '
-        '${seeds.map((s) => '${s.$1}:${s.$2}').join(', ')}');
+    final seeds = parseSeeds();
     final results = await Future.wait<List<FoundServer>>([
       for (final (host, port) in seeds)
         _probeSeed(host, port).catchError((Object error) {
@@ -785,24 +683,14 @@ class _CallPageState extends State<CallPage> {
         found[server.name] = server; // the LAN answers come last and win
       }
     }
-    for (final list in results) {
-      for (final server in list) {
-        if (server.isPublic) KnownServers.remember(server.host, server.port);
-      }
-    }
     return found.values.toList();
   }
 
-  /// The servers, fewest users first (random order on a tie): the app joins
-  /// the first one it can reach.
-  List<FoundServer> _rankServers(List<FoundServer> servers) {
-    final random = Random();
-    final keyed = [for (final s in servers) (s, random.nextDouble())];
-    keyed.sort((a, b) {
-      final byUsers = a.$1.users.compareTo(b.$1.users);
-      return byUsers != 0 ? byUsers : a.$2.compareTo(b.$2);
-    });
-    return [for (final k in keyed) k.$1];
+  /// The server with the fewest users; a random one of them on a tie.
+  FoundServer _pickServer(List<FoundServer> servers) {
+    final fewest = servers.map((s) => s.users).reduce(min);
+    final candidates = servers.where((s) => s.users == fewest).toList();
+    return candidates[Random().nextInt(candidates.length)];
   }
 
   void _scheduleReconnect(int seconds) {
@@ -843,39 +731,20 @@ class _CallPageState extends State<CallPage> {
             : 'no Janus server answered (LAN, or seeds '
                 '${seeds.map((s) => '${s.$1}:${s.$2}').join(', ')})');
       }
+      final pick = _pickServer(servers);
       _serversSummary = servers
           .map((s) => '${s.name}: ${s.users} user${s.users == 1 ? '' : 's'}')
           .join(', ');
+      _janusHost = pick.host;
+      _janusPort = pick.port;
+      _assignedServer = pick.name;
+      _setStatus('Found $_serversSummary. Joining ${pick.name}...');
 
-      // The least busy server first; if it can't be reached, the next one
-      FoundServer? joined;
-      Object? lastError;
-      for (final candidate in _rankServers(servers)) {
-        _janusHost = candidate.host;
-        _janusPort = candidate.port;
-        _assignedServer = candidate.name;
-        _setStatus('Found $_serversSummary. Joining ${candidate.name}...');
-        try {
-          await _connectWebSocket();
-          _setStatus('Creating Janus session on ${candidate.name}...');
-          final created =
-              await _request({'janus': 'create'}, needSession: false);
-          _sessionId = (created['data'] as Map)['id'] as int;
-          joined = candidate;
-          break;
-        } catch (error) {
-          print('JOIN ${candidate.name} at ${candidate.host}:${candidate.port} '
-              'failed: $error');
-          lastError = error;
-          await _closeWebSocket();
-          _sessionId = null;
-        }
-      }
-      if (joined == null) {
-        throw Exception('none of the servers found could be joined '
-            '(last error: $lastError)');
-      }
-      final FoundServer pick = joined;
+      await _connectWebSocket();
+
+      _setStatus('Creating Janus session on ${pick.name}...');
+      final created = await _request({'janus': 'create'}, needSession: false);
+      _sessionId = (created['data'] as Map)['id'] as int;
       _startKeepAlive();
 
       // Audio (required): the custom AudioCall plugin
@@ -1052,18 +921,6 @@ class _CallPageState extends State<CallPage> {
     List<String> toList(dynamic value) => value is List
         ? value.map((e) => e.toString()).where((u) => u != me).toList()
         : <String>[];
-    // Remember every server announced with a public address (new ones too)
-    int portOf(dynamic value) => (value as num?)?.toInt() ?? 8188;
-    if (r['public_host'] != null) {
-      KnownServers.remember(r['public_host'].toString(), portOf(r['ws_port']));
-    }
-    if (r['servers'] is List) {
-      for (final s in r['servers'] as List) {
-        if (s is Map && s['public_host'] != null) {
-          KnownServers.remember(s['public_host'].toString(), portOf(s['ws_port']));
-        }
-      }
-    }
     if (!mounted) return;
     setState(() {
       _thisServerName = r['server']?.toString();
@@ -1838,7 +1695,6 @@ class _CallPageState extends State<CallPage> {
               'Platform: $_platformName\n'
               'Janus: $_janusWsUrl (${_socket != null ? 'connected' : 'disconnected'})\n'
               'Servers found: ${_serversSummary.isEmpty ? '-' : _serversSummary}\n'
-              'Seeds asked: ${_seedsSummary.isEmpty ? '-' : _seedsSummary}\n'
               'Session: ${_sessionId ?? '-'}\n'
               'Audio handle: ${_audioHandleId ?? '-'}   '
               'Video handle: ${_videoHandleId ?? '-'}\n'
