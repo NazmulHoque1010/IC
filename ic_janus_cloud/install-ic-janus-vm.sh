@@ -278,9 +278,15 @@ done
   || die "--rtp-range must look like 45000-56000"
 [[ "$WS_PORT" =~ ^[0-9]+$ ]] && (( WS_PORT > 0 && WS_PORT < 65536 )) || die "--ws-port must be a port number"
 if [[ -n "$SUDO" ]]; then
-  info "Checking sudo (you may be asked for your password once)..."
-  sudo -v || die "sudo is required"
-  ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
+  # "sudo -v" asks for a password even with NOPASSWD when the user is also in
+  # the sudo group (cloud images), so test with a real command first
+  if sudo -n true 2>/dev/null; then
+    info "sudo works without a password"
+  else
+    info "Checking sudo (you may be asked for your password once)..."
+    sudo -v || die "sudo is required"
+    ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
+  fi
 fi
 ok "user $RUN_USER, source folder $SRC"
 
