@@ -110,7 +110,8 @@ show_undo() {
   fi
 }
 die()   { echo; echo "${c_r}STOPPED in step $STEP ($CURRENT): $*${c_0}"; show_undo; exit 1; }
-trap 'rc=$?; echo; echo "${c_r}FAILED in step $STEP ($CURRENT): \"$BASH_COMMAND\" (line $LINENO, exit $rc)${c_0}"; show_undo; exit $rc' ERR
+# The trap reports only in the main shell: inside a $( ... ) it ends that sub-command quietly
+trap 'rc=$?; [[ $BASH_SUBSHELL -gt 0 ]] && exit $rc; echo; echo "${c_r}FAILED in step $STEP ($CURRENT): \"$BASH_COMMAND\" (line $LINENO, exit $rc)${c_0}"; show_undo; exit $rc' ERR
 usage() { sed -n '3,/^# ====/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0; }
 
 if [[ $EUID -eq 0 ]]; then SUDO=""; else SUDO="sudo"; fi
@@ -296,7 +297,7 @@ ROUTE="$(ip -4 route get 1.1.1.1 2>/dev/null | head -1 || true)"
 IFACE="$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<<"$ROUTE")"
 MY_IP="$(sed -n 's/.* src \([0-9.]*\).*/\1/p' <<<"$ROUTE")"
 [[ -n "$MY_IP" ]] || die "could not find this VM's private IP (no default route?)"
-MY_CIDR="$(ip -4 -o addr show dev "$IFACE" | awk -v ip="$MY_IP" '{split($4,a,"/"); if (a[1]==ip) print $4}' | head -1)"
+MY_CIDR="$(ip -4 -o addr show dev "$IFACE" | awk -v ip="$MY_IP" '{split($4,a,"/"); if (a[1]==ip && !f) {print $4; f=1}}' || true)"
 MY_NET="$(python3 -c "import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]).network)" "$MY_CIDR")"
 info "private IP: $MY_IP on $IFACE (network $MY_NET)"
 
@@ -574,7 +575,7 @@ PROFILES="$(strings src/janus | grep -E '^SRTP_.*:' | head -1 || true)"
 [[ "$PROFILES" != *AEAD* ]] || die "the build still offers AES-GCM ($PROFILES)"
 [[ "$(strings src/plugins/.libs/libjanus_audiocall.so | grep -c public_host || true)" -gt 0 ]] \
   || die "this code has no public_host support (branch $BRANCH too old?)"
-ok "built $(./src/janus --version 2>/dev/null | head -1 | sed 's/^Janus version: //'), SRTP profiles: $PROFILES"
+ok "built $(./src/janus --version 2>/dev/null | sed -n '1s/^Janus version: //p' || true), SRTP profiles: $PROFILES"
 
 # =============================================================== 11. install
 step "Install to $PREFIX_DIR"
@@ -595,7 +596,7 @@ $SUDO chown -R "$RUN_USER:$RUN_GROUP" "$SRC"
 for f in "$PREFIX_DIR/bin/janus" "$PREFIX_DIR"/lib/janus/plugins/*.so "$PREFIX_DIR"/lib/janus/transports/*.so; do
   if ldd "$f" 2>/dev/null | grep 'not found' > /dev/null; then die "missing library for $f: $(ldd "$f" 2>/dev/null | grep 'not found' | head -1 || true)"; fi
 done
-ok "installed: $("$PREFIX_DIR/bin/janus" --version 2>/dev/null | grep -i commit | head -1)"
+ok "installed: $("$PREFIX_DIR/bin/janus" --version 2>/dev/null | sed -n '/[Cc]ommit/{p;q}' || true)"
 
 # =============================================================== 12. configs
 step "Configuration"
