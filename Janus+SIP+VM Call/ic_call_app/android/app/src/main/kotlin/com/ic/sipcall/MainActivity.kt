@@ -1,4 +1,4 @@
-package com.ic.ic_audiocall
+package com.ic.sipcall
 
 import io.flutter.embedding.android.FlutterActivity
 
