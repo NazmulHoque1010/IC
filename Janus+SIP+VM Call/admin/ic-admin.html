@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IC SIP Admin</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --text:#1f1f1d; --muted:#6b6a65; --line:#dcdad3;
+          --accent:#0f6e56; --danger:#a32d2d; --ok:#3b6d11; --off:#888780; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1c1c1a; --card:#262624; --text:#ecebe6; --muted:#a3a29b; --line:#3d3d3a;
+            --accent:#5dcaa5; --danger:#f09595; --ok:#97c459; --off:#888780; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:16px; font-weight:600; margin:0 0 12px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  input, select, button { font:inherit; color:inherit; border-radius:8px; border:1px solid var(--line);
+                          background:var(--bg); padding:7px 10px; }
+  input { min-width: 0; }
+  input#server { flex: 2 1 240px; } input#newName { flex: 1 1 180px; }
+  button { cursor:pointer; background:var(--card); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--danger); }
+  button:disabled { opacity:.5; cursor:default; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { color:var(--muted); font-weight:500; font-size:13px; }
+  td.actions { white-space:nowrap; text-align:right; }
+  td.actions > * { margin-left:4px; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--off); margin-right:6px; }
+  .dot.on { background:var(--ok); }
+  .msg { min-height:1.5em; margin-top:8px; font-size:14px; }
+  .msg.err { color:var(--danger); } .msg.ok { color:var(--ok); }
+  .hint { color:var(--muted); font-size:13px; margin-top:6px; }
+  .empty { color:var(--muted); padding:12px 6px; }
+  @media (max-width: 560px) { td.actions { white-space:normal; text-align:left; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>IC SIP admin</h1>
+  <p class="sub">MizuDroid users in MySQL on VM1 (table <code>ic_sip.sip_users</code>), through the status service.</p>
+
+  <section class="card">
+    <h2>Connection</h2>
+    <div class="row">
+      <input id="server" placeholder="http://__IC_PUBLIC_IP__:8190" aria-label="Status service URL">
+      <button id="saveConn" class="primary">Save</button>
+    </div>
+    <div class="hint">The status service on VM1. Remembered in this browser.</div>
+    <div id="connMsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <h2>Add user</h2>
+    <div class="row">
+      <input id="newName" placeholder="name (a-z 0-9 . _ -)" aria-label="New user name" autocomplete="off">
+      <select id="newGroup" aria-label="Group"></select>
+      <button id="addBtn" class="primary">Add</button>
+    </div>
+    <div id="addMsg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:8px">
+      <h2 style="margin:0">Users</h2>
+      <button id="refreshBtn">Refresh</button>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Group</th><th>Codec</th><th>Status</th><th></th></tr></thead>
+      <tbody id="users"></tbody>
+    </table>
+    <div id="listMsg" class="msg"></div>
+  </section>
+</main>
+
+<script>
+const GROUPS = { A: 'PCMU', B: 'GSM', C: 'PCMA' };   // same as ic_directory.lua and ic_status.py
+const NAME_RULE = /^[a-z][a-z0-9._-]{1,31}$/;        // same rule as the table
+const STORE_KEY = 'icAdminConn';
+const $ = (id) => document.getElementById(id);
+
+let conn = { server: 'http://__IC_PUBLIC_IP__:8190' };
+try { Object.assign(conn, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); } catch (e) {}
+$('server').value = conn.server;
+
+for (const g of Object.keys(GROUPS)) {
+  const o = document.createElement('option');
+  o.value = g; o.textContent = 'Group ' + g + ' - ' + GROUPS[g];
+  $('newGroup').appendChild(o);
+}
+
+function show(id, text, kind) {
+  const el = $(id);
+  el.textContent = text || '';
+  el.className = 'msg' + (kind ? ' ' + kind : '');
+}
+
+async function api(method, path, body) {
+  // The JSON goes as plain text: a "simple" request, so the browser sends it straight
+  // to ic_status.py without a CORS preflight (OPTIONS) that the service does not answer.
+  const opt = { method };
+  if (body) opt.body = JSON.stringify(body);
+  let res;
+  try {
+    res = await fetch(conn.server.replace(/\/+$/, '') + path, opt);
+  } catch (e) {
+    throw new Error('server not reachable (' + conn.server + ')');
+  }
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+
+function makeButton(label, cls, onClick) {
+  const b = document.createElement('button');
+  b.textContent = label;
+  if (cls) b.className = cls;
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function render(users) {
+  const body = $('users');
+  body.replaceChildren();
+  if (!users.length) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 5; td.className = 'empty'; td.textContent = 'No users yet.';
+    tr.appendChild(td); body.appendChild(tr);
+    return;
+  }
+  for (const u of users) {
+    const tr = document.createElement('tr');
+
+    const name = document.createElement('td');
+    name.textContent = u.name;
+
+    const group = document.createElement('td');
+    const sel = document.createElement('select');
+    sel.setAttribute('aria-label', 'Group of ' + u.name);
+    for (const g of Object.keys(GROUPS)) {
+      const o = document.createElement('option');
+      o.value = g; o.textContent = g; if (g === u.group) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.addEventListener('change', () =>
+      change(() => api('POST', '/users/group', { name: u.name, group: sel.value }),
+             u.name + ' is now in group ' + sel.value));
+    group.appendChild(sel);
+
+    const codec = document.createElement('td');
+    codec.textContent = u.codec;
+
+    const status = document.createElement('td');
+    const dot = document.createElement('span');
+    dot.className = 'dot' + (u.online ? ' on' : '');
+    status.append(dot, u.online ? 'online' : 'offline');
+
+    const actions = document.createElement('td');
+    actions.className = 'actions';
+    actions.append(
+      makeButton('Rename', '', () => {
+        const n = (prompt('New name for ' + u.name, u.name) || '').trim().toLowerCase();
+        if (!n || n === u.name) return;
+        if (!NAME_RULE.test(n)) { show('listMsg', 'Bad name: 2-32 characters a-z 0-9 . _ - (start with a letter)', 'err'); return; }
+        change(() => api('POST', '/users/rename', { name: u.name, new_name: n }), 'Renamed ' + u.name + ' to ' + n);
+      }),
+      makeButton('Delete', 'danger', () => {
+        if (!confirm('Delete ' + u.name + '? The user can no longer register.')) return;
+        change(() => api('POST', '/users/delete', { name: u.name }), 'Deleted ' + u.name);
+      })
+    );
+
+    tr.append(name, group, codec, status, actions);
+    body.appendChild(tr);
+  }
+}
+
+async function load() {
+  try {
+    const data = await api('GET', '/users');
+    render(data.users || []);
+    if ($('listMsg').classList.contains('err') && $('listMsg').dataset.src === 'load') show('listMsg', '');
+  } catch (e) {
+    show('listMsg', 'Cannot load users: ' + e.message, 'err');
+    $('listMsg').dataset.src = 'load';
+  }
+}
+
+async function change(call, okText) {
+  try {
+    await call();
+    show('listMsg', okText, 'ok');
+  } catch (e) {
+    show('listMsg', e.message, 'err');
+  }
+  $('listMsg').dataset.src = 'change';
+  load();
+}
+
+$('saveConn').addEventListener('click', () => {
+  conn.server = $('server').value.trim() || 'http://__IC_PUBLIC_IP__:8190';
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(conn)); } catch (e) {}
+  show('connMsg', 'Saved.', 'ok');
+  load();
+});
+
+$('newName').addEventListener('input', () => show('addMsg', ''));
+$('addBtn').addEventListener('click', async () => {
+  const n = $('newName').value.trim().toLowerCase();
+  if (!NAME_RULE.test(n)) { show('addMsg', 'Enter a name: 2-32 characters a-z 0-9 . _ - (start with a letter)', 'err'); return; }
+  const g = $('newGroup').value;
+  try {
+    await api('POST', '/users/add', { name: n, group: g });
+    show('addMsg', 'Added ' + n + ' (group ' + g + ')', 'ok');
+    $('newName').value = '';
+  } catch (e) {
+    show('addMsg', e.message, 'err');
+  }
+  load();
+});
+$('newName').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('addBtn').click(); });
+$('refreshBtn').addEventListener('click', load);
+
+load();
+setInterval(() => {
+  const a = document.activeElement;
+  if (!a || a.tagName !== 'SELECT') load();   // don't redraw while a group list is open
+}, 5000);
+</script>
+</body>
+</html>
