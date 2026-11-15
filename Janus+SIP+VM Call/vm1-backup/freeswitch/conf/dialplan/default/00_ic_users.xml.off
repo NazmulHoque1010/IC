@@ -1,0 +1,13 @@
+<include>
+  <extension name="ic_users">
+    <condition field="destination_number" expression="^([a-z][a-z0-9._-]{1,31})$">
+      <action application="set" data="hangup_after_bridge=true"/>
+      <action application="set" data="fail_on_single_reject=CALL_REJECTED,USER_BUSY"/>
+      <action application="set" data="call_timeout=30"/>
+      <action application="set" data="continue_on_fail=USER_NOT_REGISTERED,USER_NOT_FOUND,SUBSCRIBER_ABSENT"/>
+      <action application="bridge" data="user/$1@${domain_name}"/>
+      <action application="log" data="NOTICE ic_users: $1 not registered here, trying peer $${ic_peer_ip}"/>
+      <action application="bridge" data="sofia/peer/$1@$${ic_peer_ip}:5070"/>
+    </condition>
+  </extension>
+</include>

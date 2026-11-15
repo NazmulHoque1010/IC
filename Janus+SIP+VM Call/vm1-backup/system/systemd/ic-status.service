@@ -1,0 +1,17 @@
+[Unit]
+Description=IC status service (servers, users and load for the IC app)
+After=network-online.target freeswitch.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/ic-status/ic_status.py --config /etc/ic-status.json
+Restart=always
+RestartSec=3
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+general: {
+	server_name = "vm1"
+        media_relay_host = "__IC_LB_IP__"
+        media_relay_port = 7090
+	link_port = 7089
+	ws_port = 8188
+	public_host = "__IC_PUBLIC_IP__"
+}

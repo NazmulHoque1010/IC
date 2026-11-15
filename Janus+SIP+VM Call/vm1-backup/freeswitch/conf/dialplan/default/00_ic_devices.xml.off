@@ -1,0 +1,43 @@
+<include>
+  <!-- IC: codec by device type. The profile tells the device:
+       internal = the app through Janus (Opus), phones = a SIP phone such as MizuDroid (PCMU).
+       The callee's leg is offered only its device's codec, so FreeSWITCH converts on
+       app <-> phone calls. App <-> app calls are not handled here (they go to ic_users). -->
+
+  <extension name="ic_app_to_phone">
+    <condition field="${sofia_profile_name}" expression="^internal$"/>
+    <condition field="destination_number" expression="^[a-z][a-z0-9._-]{1,31}$"/>
+    <condition field="${sofia_contact(phones/${destination_number}@$${domain})}" expression="^sofia/">
+      <action application="set" data="absolute_codec_string=$${ic_app_audio_codec}"/>
+      <action application="set" data="hangup_after_bridge=true"/>
+      <action application="set" data="fail_on_single_reject=CALL_REJECTED,USER_BUSY"/>
+      <action application="set" data="call_timeout=30"/>
+      <action application="log" data="NOTICE ic_device: app ${caller_id_number} calls phone ${destination_number} (app $${ic_app_audio_codec}, phone $${ic_phone_codec})"/>
+      <action application="bridge" data="{absolute_codec_string=$${ic_phone_codec}}user/${destination_number}@$${domain}"/>
+    </condition>
+  </extension>
+
+  <extension name="ic_phone_to_phone">
+    <condition field="${sofia_profile_name}" expression="^phones$"/>
+    <condition field="destination_number" expression="^[a-z][a-z0-9._-]{1,31}$"/>
+    <condition field="${sofia_contact(phones/${destination_number}@$${domain})}" expression="^sofia/">
+      <action application="set" data="hangup_after_bridge=true"/>
+      <action application="set" data="fail_on_single_reject=CALL_REJECTED,USER_BUSY"/>
+      <action application="set" data="call_timeout=30"/>
+      <action application="log" data="NOTICE ic_device: phone ${caller_id_number} calls phone ${destination_number} (both $${ic_phone_codec})"/>
+      <action application="bridge" data="{absolute_codec_string=$${ic_phone_codec}}user/${destination_number}@$${domain}"/>
+    </condition>
+  </extension>
+
+  <extension name="ic_phone_to_app">
+    <condition field="${sofia_profile_name}" expression="^phones$"/>
+    <condition field="destination_number" expression="^[a-z][a-z0-9._-]{1,31}$"/>
+    <condition field="${sofia_contact(internal/${destination_number}@$${domain})}" expression="^sofia/">
+      <action application="set" data="hangup_after_bridge=true"/>
+      <action application="set" data="fail_on_single_reject=CALL_REJECTED,USER_BUSY"/>
+      <action application="set" data="call_timeout=30"/>
+      <action application="log" data="NOTICE ic_device: phone ${caller_id_number} calls app ${destination_number} (phone $${ic_phone_codec}, app $${ic_app_audio_codec})"/>
+      <action application="bridge" data="{absolute_codec_string=$${ic_app_audio_codec}}user/${destination_number}@$${domain}"/>
+    </condition>
+  </extension>
+</include>

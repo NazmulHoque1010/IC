@@ -1,0 +1,13 @@
+[Unit]
+Description=IC: restrict FreeSWITCH peer port and media ports to the other VM / janus-lb
+After=network-online.target
+Wants=network-online.target
+Before=freeswitch.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ic-peer-firewall.sh
+
+[Install]
+WantedBy=multi-user.target

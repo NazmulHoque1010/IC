@@ -1,0 +1,21 @@
+{
+  "server": "vm1",
+  "public_host": "__IC_PUBLIC_IP__",
+  "ws_port": 8188,
+  "sip_proxy": "sip:127.0.0.1:5060",
+  "domain": "ic.local",
+  "listen": "0.0.0.0",
+  "port": 8190,
+  "peers": [
+    "http://__IC_PEER_IP__:8190"
+  ],
+  "esl": {
+    "host": "127.0.0.1",
+    "port": 8021,
+    "password": "ClueCon"
+  },
+  "sip_profiles": [
+    "internal",
+    "phones"
+  ]
+}

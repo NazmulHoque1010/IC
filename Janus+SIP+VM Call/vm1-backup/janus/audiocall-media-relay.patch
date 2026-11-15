@@ -1,0 +1,93 @@
+diff --git a/src/plugins/janus_audiocall.c b/src/plugins/janus_audiocall.c
+index cd35543..2305b1a 100644
+--- a/src/plugins/janus_audiocall.c
++++ b/src/plugins/janus_audiocall.c
+@@ -420,6 +420,7 @@ typedef struct janus_audiocall_session {
+ 	char *remote_username;		/* Username of our partner on the peer server */
+ 	gboolean remote_video_seen;	/* Got the first video packet from the peer (keyframe requested) */
+ 	struct sockaddr_in remote_addr;	/* Link address of the server our partner is on */
++	struct sockaddr_in media_addr;	/* IC: where this call's media is sent/accepted: the relay if configured, else remote_addr */
+ 	char *remote_server;		/* Name of that server */
+ 	janus_mutex mutex;
+ 	janus_refcount ref;
+@@ -523,6 +524,11 @@ static gboolean link_enabled = FALSE;
+ static char *link_server_name = NULL;
+ static uint16_t link_local_port = JANUS_AUDIOCALL_DEFAULT_LINK_PORT, link_ws_port = 8188;
+ static char *link_public_host = NULL;	/* address apps use to reach this server (public_host), or NULL */
++/* IC: optional media relay. When set, cross-server call media is sent to (and only
++ * accepted from) this address instead of the peer server directly. Signaling is
++ * unaffected and still goes straight to the peer. */
++static struct sockaddr_in link_media_relay;
++static gboolean link_media_relay_set = FALSE;
+ static int link_fd = -1;
+ static GThread *link_thread = NULL;
+ static volatile gint link_dirty = 0;			/* our users changed: announce now */
+@@ -709,6 +715,8 @@ static void janus_audiocall_remote_add(janus_audiocall_session *session, guint32
+ 	session->call_id = call_id;
+ 	session->remote_video_seen = FALSE;
+ 	session->remote_addr = *remote_addr;
++	/* IC: this call's media goes via the relay if one is configured, else straight to the peer */
++	session->media_addr = link_media_relay_set ? link_media_relay : *remote_addr;
+ 	g_free(session->remote_username);
+ 	session->remote_username = g_strdup(remote_username);
+ 	g_free(session->remote_server);
+@@ -1208,9 +1216,9 @@ static void *janus_audiocall_link_thread(void *data) {
+ 			janus_audiocall_session *session = janus_audiocall_remote_get(call_id);
+ 			if(session == NULL)
+ 				continue;
+-			if(!janus_audiocall_same_addr(&session->remote_addr, &from) ||
++			if(!janus_audiocall_same_addr(&session->media_addr, &from) ||
+ 					g_atomic_int_get(&session->destroyed) || g_atomic_int_get(&session->hangingup)) {
+-				/* Not from the server this call is with (or the call is ending): drop it */
++				/* Not from the media source this call uses (or the call is ending): drop it */
+ 				janus_refcount_decrease(&session->ref);
+ 				continue;
+ 			}
+@@ -1319,6 +1327,25 @@ int janus_audiocall_init(janus_callbacks *callback, const char *config_path) {
+ 		item = janus_config_get(config, config_general, janus_config_type_item, "public_host");
+ 		if(item != NULL && item->value != NULL && strlen(item->value) > 0)
+ 			link_public_host = g_strdup(item->value);
++		/* IC: optional media relay (media_relay_host / media_relay_port). When set, this
++		 * server forwards all cross-server call media to that address, and only accepts
++		 * call media coming back from it. Leave it unset for the original direct behaviour. */
++		item = janus_config_get(config, config_general, janus_config_type_item, "media_relay_host");
++		if(item != NULL && item->value != NULL && strlen(item->value) > 0) {
++			uint16_t mrport = JANUS_AUDIOCALL_DEFAULT_LINK_PORT;
++			janus_config_item *pitem = janus_config_get(config, config_general, janus_config_type_item, "media_relay_port");
++			if(pitem != NULL && pitem->value != NULL && janus_string_to_uint16(pitem->value, &mrport) < 0)
++				JANUS_LOG(LOG_WARN, "[AudioCall] Invalid media_relay_port '%s', using %d\n", pitem->value, mrport);
++			memset(&link_media_relay, 0, sizeof(link_media_relay));
++			link_media_relay.sin_family = AF_INET;
++			link_media_relay.sin_port = htons(mrport);
++			if(inet_pton(AF_INET, item->value, &link_media_relay.sin_addr) == 1) {
++				link_media_relay_set = TRUE;
++				JANUS_LOG(LOG_INFO, "[AudioCall] Media relay enabled: cross-server call media via %s:%u\n", item->value, mrport);
++			} else {
++				JANUS_LOG(LOG_WARN, "[AudioCall] Invalid media_relay_host '%s', media relay disabled\n", item->value);
++			}
++		}
+ 		if(janus_config_get(config, config_general, janus_config_type_item, "peer_host") != NULL ||
+ 				janus_config_get(config, config_general, janus_config_type_item, "peer_port") != NULL) {
+ 			JANUS_LOG(LOG_WARN, "[AudioCall] peer_host/peer_port are no longer used (other servers are found automatically), ignoring them\n");
+@@ -1655,10 +1682,10 @@ void janus_audiocall_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp
+ 				return;
+ #ifdef IC_VIDEO
+ 			if(packet->video ? session->video_active : session->audio_active)
+-				janus_audiocall_link_send_rtp(&session->remote_addr, call_id, packet->video, packet->buffer, packet->length);
++				janus_audiocall_link_send_rtp(&session->media_addr, call_id, packet->video, packet->buffer, packet->length);
+ #else
+ 			if(!packet->video && session->audio_active)
+-				janus_audiocall_link_send_rtp(&session->remote_addr, call_id, FALSE, packet->buffer, packet->length);
++				janus_audiocall_link_send_rtp(&session->media_addr, call_id, FALSE, packet->buffer, packet->length);
+ #endif
+ 			return;
+ 		}
+@@ -1766,7 +1793,7 @@ void janus_audiocall_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rt
+ 					janus_rtcp_has_fir(packet->buffer, packet->length))) {
+ 				guint32 call_id = session->call_id;
+ 				if(call_id != 0)
+-					janus_audiocall_link_send_keyframe_request(&session->remote_addr, call_id);
++					janus_audiocall_link_send_keyframe_request(&session->media_addr, call_id);
+ 			}
+ #endif
+ 			return;
