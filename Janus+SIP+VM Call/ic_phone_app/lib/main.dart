@@ -2,10 +2,15 @@
 //
 // - Registers ONCE, through Janus (WebSocket 8188) and its SIP plugin, in FreeSWITCH
 //   (profile "internal") as <name>@ic.local with password 1234. No database row needed.
-// - Calls MizuDroid users and receives their calls. The app offers and accepts Opus
-//   only; FreeSWITCH converts to each phone's group codec (A PCMU, B GSM, C PCMA).
-// - Manages the MizuDroid users in MySQL through the status service (HTTP 8190):
-//   add, rename, change group, delete.
+// - Calls any name or number typed in the "call" box, and receives calls. The app offers
+//   and accepts Opus only; FreeSWITCH converts to each phone's group codec.
+// - Two big call buttons: green calls as the app's own name, blue calls as a database user
+//   that you lock in ("call as"). The locked-in name is saved, but it is registered only
+//   for the call: a second Janus session registers it when you press blue and
+//   un-registers it when the call ends. Blue is off while that user's SIP phone is online
+//   (FreeSWITCH would refuse it anyway).
+// - Reads the database users from the status service (HTTP 8190) only to check the
+//   locked-in name; the list itself is not shown.
 // - Asks for a name once, remembers it and registers on every start until
 //   "Disconnect & rename".
 import 'dart:async';
@@ -27,10 +32,11 @@ const String kDomain = 'ic.local';
 const String kSipProxy = 'sip:127.0.0.1:5060'; // FreeSWITCH "internal", seen from Janus
 const String kPassword = '1234';
 const String kNameKey = 'ic_name';
-// Same name rule as the database and ic_directory.lua.
+// The app's own name: starts with a letter, so it never takes a phone number from the database.
 final RegExp kNameRule = RegExp(r'^[a-z][a-z0-9._-]{1,31}$');
-// Same mapping as ic_directory.lua and ic_status.py.
-const Map<String, String> kGroupCodec = {'A': 'PCMU', 'B': 'GSM', 'C': 'PCMA'};
+// Who can be called: same rule as the database, ic_directory.lua and the dialplan (numbers allowed).
+final RegExp kCalleeRule = RegExp(r'^[a-z0-9][a-z0-9._-]{1,31}$');
+const String kCallAsKey = 'ic_call_as'; // the locked-in "call as" database user
 
 final GlobalKey<ScaffoldMessengerState> kMessenger = GlobalKey<ScaffoldMessengerState>();
 
@@ -151,9 +157,10 @@ class JanusSip {
     await message({'request': 'accept'}, jsep: {'type': local.type, 'sdp': local.sdp});
   }
 
-  Future<void> decline() async {
+  /// Refuse the incoming call (code 486 = busy, used when we are already in a call).
+  Future<void> decline({int? code}) async {
     _incomingJsep = null;
-    await message({'request': 'decline'});
+    await message({'request': 'decline', if (code != null) 'code': code});
   }
 
   /// Hang up: tell the server first, then close our audio.
@@ -538,6 +545,7 @@ class _NameScreenState extends State<NameScreen> {
   }
 }
 
+
 enum CallState { idle, calling, incoming, active }
 
 class HomeScreen extends StatefulWidget {
@@ -550,8 +558,21 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  final JanusSip _sip = JanusSip(kServer);
+  final JanusSip _sip = JanusSip(kServer); // the app's own name, always registered
   final UsersApi _usersApi = UsersApi(kServer);
+
+  // "Call as": the locked-in database user (saved on the phone), and the second Janus
+  // session that registers it. That session lives only for one call.
+  String? _callAsName;
+  JanusSip? _borrowed;
+  String _borrowedName = '';
+  bool _borrowCallPlaced = false; // false while it is still registering
+  JanusSip get _active => _borrowed ?? _sip; // the session the current call runs on
+
+  final _callAsCtrl = TextEditingController();
+  String? _callAsError;
+  final _dialCtrl = TextEditingController();
+  String? _dialError;
 
   String _status = 'Connecting...';
   bool _registered = false;
@@ -560,7 +581,9 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _refresh;
   Timer? _ticker;
 
+  // Database users: not shown, only used to check the "call as" name.
   List<PhoneUser> _users = [];
+  bool _usersLoaded = false;
   String? _usersError;
 
   CallState _call = CallState.idle;
@@ -574,7 +597,8 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     _sip.onRegistration = _onRegistration;
-    _sip.onCallEvent = _onCallEvent;
+    _sip.onCallEvent = (event, r) => _onCallEvent(_sip, event, r);
+    _loadCallAs();
     _start();
     _loadUsers();
     _refresh = Timer.periodic(const Duration(seconds: 5), (_) {
@@ -588,11 +612,14 @@ class _HomeScreenState extends State<HomeScreen> {
     _retry?.cancel();
     _refresh?.cancel();
     _ticker?.cancel();
+    _callAsCtrl.dispose();
+    _dialCtrl.dispose();
+    _releaseBorrowed();
     _sip.close();
     super.dispose();
   }
 
-  // ---- registration ----
+  // ---- registration (the app's own name) ----
 
   /// Connect to Janus and register the saved name.
   Future<void> _start() async {
@@ -613,7 +640,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _onRegistration(String state, String? detail) {
     if (!mounted || _leaving) return;
-    if (state == 'disconnected' && _call != CallState.idle) _endCall('Connection lost');
+    // A "call as" call runs on its own session, so it survives a drop of the main one.
+    if (state == 'disconnected' && _call != CallState.idle && _borrowed == null) {
+      _endCall('Connection lost');
+    }
     setState(() {
       _registered = state == 'registered';
       switch (state) {
@@ -637,14 +667,78 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _disconnectAndRename() async {
     _leaving = true;
     _retry?.cancel();
+    await _releaseBorrowed();
     await _sip.close();
     widget.onRename();
   }
 
+  // ---- "call as" database user ----
+
+  Future<void> _loadCallAs() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() => _callAsName = prefs.getString(kCallAsKey));
+  }
+
+  /// Lock in the typed database user. This only saves the name: nothing is registered.
+  Future<void> _lockCallAs() async {
+    final name = _callAsCtrl.text.trim().toLowerCase();
+    String? error;
+    if (!kCalleeRule.hasMatch(name)) {
+      error = '2-32 characters: a-z 0-9 . _ -';
+    } else if (name == widget.name) {
+      error = 'That is your own name';
+    } else if (!_usersLoaded || _usersError != null) {
+      error = 'Cannot check the database right now, try again';
+    } else if (!_users.any((u) => u.name == name)) {
+      error = '$name is not in the database';
+    }
+    setState(() => _callAsError = error);
+    if (error != null) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(kCallAsKey, name);
+    if (!mounted) return;
+    FocusScope.of(context).unfocus();
+    _callAsCtrl.clear();
+    setState(() => _callAsName = name);
+  }
+
+  /// Remove the locked-in name, so another one can be typed.
+  Future<void> _unlockCallAs() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(kCallAsKey);
+    if (!mounted) return;
+    setState(() => _callAsName = null);
+  }
+
+  /// Can the blue button be used now? And a note saying why (not).
+  (bool, String) get _callAsCheck {
+    final n = _callAsName;
+    if (n == null) return (false, 'Lock in a database user to use the blue button.');
+    if (!_usersLoaded) return (false, 'Checking $n...');
+    if (_usersError != null) return (false, 'Cannot check $n: the users list is unavailable.');
+    final found = _users.where((u) => u.name == n).toList();
+    if (found.isEmpty) return (false, '$n is no longer in the database.');
+    if (found.first.online) return (false, '$n is online on a SIP phone: blue is off.');
+    return (true, '$n is free. It is registered only during the call.');
+  }
+
   // ---- calls ----
 
-  void _onCallEvent(String event, Map<String, dynamic> r) {
+  /// Call events from either session. Only the session of the current call drives the
+  /// screen; a call that arrives on the other one (or while busy) is refused with 486.
+  void _onCallEvent(JanusSip from, String event, Map<String, dynamic> r) {
     if (!mounted) return;
+    if (event == 'incoming' && (_call != CallState.idle || from != _active)) {
+      from.decline(code: 486).catchError((_) {});
+      _toast('Missed call from ${_nameFromUri(r['username'] as String?)} (you were busy)');
+      return;
+    }
+    if (event == 'missed_call') {
+      _toast('Missed call from ${_nameFromUri(r['caller'] as String?)} (you were busy)');
+      return;
+    }
+    if (from != _active) return; // the idle session has nothing to show
     switch (event) {
       case 'incoming':
         setState(() {
@@ -667,15 +761,13 @@ class _HomeScreenState extends State<HomeScreen> {
             : 'Call ended: $code ${r['reason'] ?? ''}');
       case 'janus_hangup':
         if (_call != CallState.idle) {
-          _sip.hangup();
+          from.hangup();
           _endCall('Media connection lost');
         }
-      case 'missed_call':
-        _toast('Missed call from ${_nameFromUri(r['caller'] as String?)} (you were busy)');
       case 'error':
         _toast('SIP error: ${r['reason']}');
         if (_call != CallState.idle) {
-          _sip.closeMedia();
+          from.closeMedia();
           _endCall(null);
         }
     }
@@ -684,6 +776,7 @@ class _HomeScreenState extends State<HomeScreen> {
   String _nameFromUri(String? uri) =>
       RegExp(r'^sips?:([^@]+)@').firstMatch(uri ?? '')?.group(1) ?? (uri ?? 'unknown');
 
+  /// Green button: call as the app's own name.
   Future<void> _callUser(String name) async {
     setState(() {
       _call = CallState.calling;
@@ -698,6 +791,74 @@ class _HomeScreenState extends State<HomeScreen> {
       await _sip.closeMedia();
       _endCall('Call failed: $e');
     }
+  }
+
+  /// Blue button: register the locked-in database user on a second Janus session, call
+  /// from it, and drop the registration when the call ends (_endCall -> _releaseBorrowed).
+  Future<void> _callAs(String callee) async {
+    final from = _callAsName!;
+    final b = JanusSip(kServer);
+    _borrowed = b;
+    _borrowedName = from;
+    _borrowCallPlaced = false;
+    setState(() {
+      _call = CallState.calling;
+      _peer = callee;
+      _callNote = 'Registering as $from...';
+      _muted = false;
+      _speaker = false;
+    });
+    final registered = Completer<void>();
+    b.onRegistration = (state, detail) {
+      if (state == 'registered') {
+        if (!registered.isCompleted) registered.complete();
+      } else if (state == 'failed' || state == 'disconnected') {
+        if (!registered.isCompleted) {
+          registered.completeError(Exception(detail ?? state));
+        } else if (_borrowed == b && _call != CallState.idle) {
+          _endCall('Connection lost');
+        }
+      }
+    };
+    b.onCallEvent = (event, r) => _onCallEvent(b, event, r);
+    try {
+      await b.connect();
+      await b.register(from);
+      await registered.future.timeout(const Duration(seconds: 10));
+      if (!mounted || _borrowed != b) return; // hung up while registering
+      setState(() => _callNote = 'Calling as $from...');
+      _borrowCallPlaced = true;
+      await b.call(callee);
+    } catch (e) {
+      if (_borrowed != b) return; // already ended and released
+      _endCall('Could not call as $from: $e\n'
+          '(FreeSWITCH refuses it while its SIP phone is online.)');
+    }
+  }
+
+  /// Un-register the borrowed name and close its Janus session.
+  Future<void> _releaseBorrowed() async {
+    final b = _borrowed;
+    _borrowed = null;
+    _borrowCallPlaced = false;
+    if (b != null) await b.close();
+  }
+
+  /// The two big buttons: check the typed name, then call as ourselves or as the locked-in user.
+  void _dial({required bool asCallAs}) {
+    final name = _dialCtrl.text.trim().toLowerCase();
+    String? error;
+    if (!kCalleeRule.hasMatch(name)) {
+      error = '2-32 characters: a-z 0-9 . _ -';
+    } else if (name == widget.name) {
+      error = 'That is your own name';
+    } else if (asCallAs && name == _callAsName) {
+      error = '$name cannot call itself';
+    }
+    setState(() => _dialError = error);
+    if (error != null) return;
+    FocusScope.of(context).unfocus();
+    asCallAs ? _callAs(name) : _callUser(name);
   }
 
   Future<void> _accept() async {
@@ -718,7 +879,12 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _hangup() async {
-    await _sip.hangup();
+    final s = _active;
+    if (s == _borrowed && !_borrowCallPlaced) {
+      await s.closeMedia(); // still registering: there is no call to hang up yet
+    } else {
+      await s.hangup();
+    }
     _endCall('Call ended');
   }
 
@@ -738,6 +904,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _endCall(String? note) {
     _ticker?.cancel();
+    _releaseBorrowed(); // the borrowed name is registered only for the call
     if (!mounted) return;
     final wasInCall = _call != CallState.idle;
     setState(() {
@@ -751,7 +918,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _toggleMute() {
     setState(() => _muted = !_muted);
-    _sip.setMuted(_muted);
+    _active.setMuted(_muted);
   }
 
   void _toggleSpeaker() {
@@ -765,7 +932,7 @@ class _HomeScreenState extends State<HomeScreen> {
     return '${two(d.inMinutes)}:${two(d.inSeconds % 60)}';
   }
 
-  // ---- users in the database ----
+  // ---- database users (not shown) ----
 
   Future<void> _loadUsers() async {
     try {
@@ -773,6 +940,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       setState(() {
         _users = users;
+        _usersLoaded = true;
         _usersError = null;
       });
     } catch (e) {
@@ -791,8 +959,7 @@ class _HomeScreenState extends State<HomeScreen> {
         title: Text('IC Phone - ${widget.name}'),
         actions: [
           if (!inCall)
-            IconButton(
-                icon: const Icon(Icons.refresh), tooltip: 'Refresh users', onPressed: _loadUsers),
+            IconButton(icon: const Icon(Icons.refresh), tooltip: 'Refresh', onPressed: _loadUsers),
           if (!inCall)
             PopupMenuButton<String>(
               onSelected: (_) => _disconnectAndRename(),
@@ -807,62 +974,170 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _homeView() {
-    return RefreshIndicator(
-      onRefresh: _loadUsers,
-      child: ListView(
-        padding: const EdgeInsets.only(bottom: 88),
+    return ListView(
+      padding: const EdgeInsets.only(bottom: 24),
+      children: [
+        Card(
+          margin: const EdgeInsets.all(12),
+          child: ListTile(
+            leading: Icon(_registered ? Icons.check_circle : Icons.cloud_off,
+                color: _registered ? Colors.green : Colors.grey),
+            title: Text(_status),
+            subtitle: Text('${widget.name}@$kDomain via Janus on $kServer'),
+          ),
+        ),
+        _callAsCard(),
+        _dialCard(),
+      ],
+    );
+  }
+
+  /// "Call as": type a database user and lock it in. Locking only saves the name.
+  Widget _callAsCard() {
+    final (ok, note) = _callAsCheck;
+    final locked = _callAsName;
+    final theme = Theme.of(context);
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 8, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Call as (database user, blue button)', style: theme.textTheme.titleSmall),
+            const SizedBox(height: 4),
+            if (locked == null)
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _callAsCtrl,
+                      decoration:
+                          InputDecoration(labelText: 'Name or number', errorText: _callAsError),
+                      onChanged: (_) {
+                        if (_callAsError != null) setState(() => _callAsError = null);
+                      },
+                      onSubmitted: (_) => _lockCallAs(),
+                    ),
+                  ),
+                  IconButton(icon: const Icon(Icons.lock), tooltip: 'Lock in', onPressed: _lockCallAs),
+                ],
+              )
+            else
+              Row(
+                children: [
+                  const Icon(Icons.lock, color: Colors.blue),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(locked, style: theme.textTheme.titleLarge)),
+                  TextButton.icon(
+                    onPressed: _call == CallState.idle ? _unlockCallAs : null,
+                    icon: const Icon(Icons.close),
+                    label: const Text('Remove'),
+                  ),
+                ],
+              ),
+            const SizedBox(height: 4),
+            Text(note,
+                style: theme.textTheme.bodySmall?.copyWith(color: ok ? Colors.green[700] : null)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Type who to call, then one of the two big buttons.
+  Widget _dialCard() {
+    final canDial = _registered && _call == CallState.idle;
+    final (callAsOk, _) = _callAsCheck;
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            TextField(
+              controller: _dialCtrl,
+              decoration: InputDecoration(
+                labelText: 'Name or number to call',
+                errorText: _dialError,
+                prefixIcon: const Icon(Icons.dialpad),
+              ),
+              textInputAction: TextInputAction.go,
+              onChanged: (_) {
+                if (_dialError != null) setState(() => _dialError = null);
+              },
+              onSubmitted: (_) {
+                if (canDial) _dial(asCallAs: false);
+              },
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(
+                  child: _bigCallButton(
+                    color: Colors.green,
+                    who: widget.name,
+                    onPressed: canDial ? () => _dial(asCallAs: false) : null,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _bigCallButton(
+                    color: Colors.blue,
+                    who: _callAsName ?? 'nobody locked in',
+                    onPressed: canDial && callAsOk ? () => _dial(asCallAs: true) : null,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// A big call button: phone icon, "Call as" and the name it calls from. Grey when off.
+  Widget _bigCallButton(
+      {required Color color, required String who, required VoidCallback? onPressed}) {
+    return FilledButton(
+      style: FilledButton.styleFrom(
+        backgroundColor: color,
+        minimumSize: const Size.fromHeight(72),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      ),
+      onPressed: onPressed,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Card(
-            margin: const EdgeInsets.all(12),
-            child: ListTile(
-              leading: Icon(_registered ? Icons.check_circle : Icons.cloud_off,
-                  color: _registered ? Colors.green : Colors.grey),
-              title: Text(_status),
-              subtitle: Text('${widget.name}@$kDomain via Janus on $kServer'),
+          const Icon(Icons.call, size: 30),
+          const SizedBox(width: 10),
+          Flexible(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Call as', style: TextStyle(fontSize: 12)),
+                Text(who,
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    overflow: TextOverflow.ellipsis),
+              ],
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-            child: Text('SIP phone users (MizuDroid)',
-                style: Theme.of(context).textTheme.titleSmall),
-          ),
-          if (_usersError != null)
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text(_usersError!, style: const TextStyle(color: Colors.red)),
-            ),
-          if (_users.isEmpty && _usersError == null)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: Text('No SIP phone users yet. Tap "Add user".'),
-            ),
-          for (final u in _users) _userTile(u),
         ],
       ),
     );
   }
 
-  Widget _userTile(PhoneUser u) {
-    final canCall = _registered && u.online && _call == CallState.idle;
-    return ListTile(
-      leading: Icon(Icons.circle, size: 14, color: u.online ? Colors.green : Colors.grey),
-      title: Text(u.name),
-      subtitle: Text('Group ${u.group} - ${u.codec} - ${u.online ? 'online' : 'offline'}'),
-      trailing: IconButton(
-        icon: const Icon(Icons.call),
-        color: Colors.green,
-        tooltip: 'Call',
-        onPressed: canCall ? () => _callUser(u.name) : null,
-      ),
-    );
-  }
   Widget _callView() {
     final peer = _users.where((u) => u.name == _peer).toList();
     final peerCodec = peer.isEmpty ? '?' : '${peer.first.codec} (group ${peer.first.group})';
+    final me = _borrowed != null ? _borrowedName : widget.name;
+    final asNote = _borrowed != null ? ' as $_borrowedName' : '';
     final title = switch (_call) {
       CallState.incoming => '$_peer is calling',
-      CallState.calling => 'Calling $_peer',
-      CallState.active => 'In call with $_peer',
+      CallState.calling => 'Calling $_peer$asNote',
+      CallState.active => 'In call with $_peer$asNote',
       CallState.idle => '',
     };
     final note = _call == CallState.active ? _duration() : _callNote;
@@ -880,7 +1155,8 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 8),
             Text(note),
             const SizedBox(height: 8),
-            Text('You: OPUS    $_peer: $peerCodec', style: Theme.of(context).textTheme.bodySmall),
+            Text('You ($me): OPUS    $_peer: $peerCodec',
+                style: Theme.of(context).textTheme.bodySmall),
             const SizedBox(height: 32),
             if (_call == CallState.incoming)
               Row(
