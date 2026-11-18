@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>org.linphone</groupId>
+  <artifactId>linphone-sdk-android</artifactId>
+  <versioning>
+    <latest>5.4.130</latest>
+    <release>5.4.130</release>
+    <versions>
+      <version>5.4.130</version>
+    </versions>
+    <lastUpdated>20261118082057</lastUpdated>
+  </versioning>
+</metadata>
